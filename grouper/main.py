@@ -1,0 +1,150 @@
+"""CLI entry point for company name grouping."""
+
+import argparse
+import sys
+from grouper.processor import CompanyGrouper
+
+
+def main():
+    """Main CLI entry point."""
+    parser = argparse.ArgumentParser(
+        description="Group company names using embeddings and FAISS approximate nearest neighbor search",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic usage
+  python -m grouper.main --input companies.csv --output grouped.csv
+  
+  # Specify column name
+  python -m grouper.main --input companies.csv --output grouped.csv --column "name"
+  
+  # Custom threshold and model
+  python -m grouper.main --input companies.csv --output grouped.csv --threshold 0.90 --model paraphrase-multilingual-mpnet-base-v2
+  
+  # Large dataset with custom batch size
+  python -m grouper.main --input large.csv --output grouped.csv --batch-size 64 --top-k 100
+        """
+    )
+    
+    # Required arguments
+    parser.add_argument(
+        '--input',
+        type=str,
+        required=True,
+        help='Input CSV file path containing company names'
+    )
+    
+    parser.add_argument(
+        '--output',
+        type=str,
+        required=True,
+        help='Output CSV file path for grouped results'
+    )
+    
+    # Optional arguments
+    parser.add_argument(
+        '--column',
+        type=str,
+        default='company_name',
+        help='Column name containing company names (default: company_name)'
+    )
+    
+    parser.add_argument(
+        '--model',
+        type=str,
+        default='sentence-transformers/all-MiniLM-L6-v2',
+        help='Embedding model name (default: sentence-transformers/all-MiniLM-L6-v2)'
+    )
+    
+    parser.add_argument(
+        '--threshold',
+        type=float,
+        default=0.85,
+        help='Similarity threshold for clustering (default: 0.85)'
+    )
+    
+    parser.add_argument(
+        '--top-k',
+        type=int,
+        default=50,
+        help='Number of nearest neighbors to retrieve per company (default: 50)'
+    )
+    
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=32,
+        help='Batch size for embedding generation (default: 32)'
+    )
+    
+    parser.add_argument(
+        '--index-type',
+        type=str,
+        default='auto',
+        choices=['auto', 'flat', 'hnsw', 'ivf'],
+        help='FAISS index type (default: auto)'
+    )
+    
+    parser.add_argument(
+        '--clustering',
+        type=str,
+        default='connected_components',
+        choices=['connected_components'],
+        help='Clustering method (default: connected_components)'
+    )
+    
+    parser.add_argument(
+        '--canonical-method',
+        type=str,
+        default='longest',
+        choices=['longest', 'most_frequent', 'centroid'],
+        help='Method to select canonical name per cluster (default: longest)'
+    )
+    
+    parser.add_argument(
+        '--quiet',
+        action='store_true',
+        help='Suppress progress messages'
+    )
+    
+    args = parser.parse_args()
+    
+    # Validate threshold
+    if not 0.0 <= args.threshold <= 1.0:
+        print("Error: threshold must be between 0.0 and 1.0", file=sys.stderr)
+        sys.exit(1)
+    
+    # Initialize processor
+    grouper = CompanyGrouper(
+        model_name=args.model,
+        batch_size=args.batch_size,
+        threshold=args.threshold,
+        top_k=args.top_k,
+        index_type=args.index_type,
+        clustering_method=args.clustering,
+        canonical_method=args.canonical_method,
+        verbose=not args.quiet
+    )
+    
+    # Process
+    try:
+        stats = grouper.process(
+            input_file=args.input,
+            output_file=args.output,
+            column_name=args.column
+        )
+        
+        print(f"Successfully processed {stats['total_records']:,} records")
+        print(f"Results saved to: {args.output}")
+        
+    except Exception as e:
+        print(f"Error: {str(e)}", file=sys.stderr)
+        import traceback
+        if not args.quiet:
+            traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
+
