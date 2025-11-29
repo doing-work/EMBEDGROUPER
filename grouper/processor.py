@@ -112,6 +112,9 @@ class CompanyGrouper:
         # Step 5: Find similar pairs and cluster
         print_progress("Clustering companies...", self.verbose)
         cluster_start = time.time()
+        # Use larger batch size for search on very large datasets
+        search_batch_size = min(5000, max(1000, n_samples // 500)) if n_samples > 100000 else 1000
+        
         cluster_assignments, canonical_names, similarity_scores, neighbor_counts, cluster_sizes = cluster_companies(
             n_samples=n_samples,
             faiss_index=faiss_index,
@@ -122,6 +125,7 @@ class CompanyGrouper:
             top_k=self.top_k,
             clustering_method=self.clustering_method,
             canonical_method=self.canonical_method,
+            search_batch_size=search_batch_size,
             verbose=self.verbose
         )
         self.timing_stats['clustering'] = time.time() - cluster_start

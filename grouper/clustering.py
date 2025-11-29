@@ -4,6 +4,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 import networkx as nx
 from collections import Counter
+from tqdm import tqdm
 from .utils import print_progress
 
 
@@ -135,6 +136,7 @@ def cluster_companies(
     top_k: int = 50,
     clustering_method: str = "connected_components",
     canonical_method: str = "longest",
+    search_batch_size: int = 1000,
     verbose: bool = True
 ) -> Tuple[Dict[int, int], Dict[int, str], Dict[int, float], Dict[int, int], Dict[int, int]]:
     """
@@ -162,35 +164,53 @@ def cluster_companies(
     """
     print_progress(f"Finding similar pairs (threshold={threshold})...", verbose)
     
-    # Find all similar pairs
+    # Find all similar pairs - batch processing for efficiency
     similarity_pairs = []
     neighbor_counts = {}
     
-    for i in range(n_samples):
-        if verbose and i % 10000 == 0:
-            print_progress(f"Processed {i}/{n_samples} companies...", verbose)
+    # Process in batches for better performance
+    # Use larger batches for very large datasets
+    if search_batch_size is None:
+        search_batch_size = min(1000, max(100, n_samples // 1000))
+    total_batches = (n_samples + search_batch_size - 1) // search_batch_size
+    
+    # Use tqdm for progress tracking
+    batch_range = range(total_batches)
+    if verbose:
+        batch_range = tqdm(batch_range, desc="Finding similar pairs", unit="batch")
+    
+    for batch_idx in batch_range:
+        start_idx = batch_idx * search_batch_size
+        end_idx = min(start_idx + search_batch_size, n_samples)
+        batch_indices = list(range(start_idx, end_idx))
         
-        # Search for neighbors
-        distances, indices = faiss_index.search_single(
-            embeddings[i],
+        # Batch search for all companies in this batch
+        batch_embeddings = embeddings[start_idx:end_idx]
+        distances_batch, indices_batch = faiss_index.search(
+            batch_embeddings,
             k=top_k,
             threshold=threshold
         )
         
-        # Count valid neighbors (excluding self and -1 padding)
-        valid_neighbors = [
-            (int(indices[j]), float(distances[j]))
-            for j in range(len(indices))
-            if indices[j] != -1 and indices[j] != i
-        ]
-        
-        neighbor_counts[i] = len(valid_neighbors)
-        
-        # Add to similarity pairs
-        for neighbor_idx, similarity in valid_neighbors:
-            # Add both directions, but we'll deduplicate in graph building
-            if i < neighbor_idx:  # Only add once per pair
-                similarity_pairs.append((i, neighbor_idx, similarity))
+        # Process results for each company in the batch
+        for local_idx, global_idx in enumerate(batch_indices):
+            distances = distances_batch[local_idx]
+            indices = indices_batch[local_idx]
+            
+            # Count valid neighbors (excluding self and -1 padding)
+            valid_neighbors = [
+                (int(indices[j]), float(distances[j]))
+                for j in range(len(indices))
+                if indices[j] != -1 and indices[j] != global_idx
+            ]
+            
+            neighbor_counts[global_idx] = len(valid_neighbors)
+            
+            # Add to similarity pairs
+            for neighbor_idx, similarity in valid_neighbors:
+                # Add both directions, but we'll deduplicate in graph building
+                if global_idx < neighbor_idx:  # Only add once per pair
+                    similarity_pairs.append((global_idx, neighbor_idx, similarity))
     
     print_progress(f"Found {len(similarity_pairs)} similar pairs", verbose)
     
