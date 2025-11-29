@@ -4,7 +4,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 import networkx as nx
 from collections import Counter
-from grouper.utils import print_progress
+from .utils import print_progress
 
 
 def build_similarity_graph(

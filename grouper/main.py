@@ -2,7 +2,13 @@
 
 import argparse
 import sys
-from grouper.processor import CompanyGrouper
+
+# Handle both module and direct execution
+try:
+    from .processor import CompanyGrouper
+except ImportError:
+    # Fallback for direct execution
+    from processor import CompanyGrouper
 
 
 def main():

@@ -5,7 +5,7 @@ from typing import List, Optional
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
-from grouper.utils import get_device, print_progress
+from .utils import get_device, print_progress
 
 
 class EmbeddingGenerator:

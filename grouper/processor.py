@@ -5,11 +5,11 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple
 
-from grouper.normalizer import normalize_company_names
-from grouper.embeddings import EmbeddingGenerator
-from grouper.faiss_index import FAISSIndex
-from grouper.clustering import cluster_companies
-from grouper.utils import print_progress, format_time
+from .normalizer import normalize_company_names
+from .embeddings import EmbeddingGenerator
+from .faiss_index import FAISSIndex
+from .clustering import cluster_companies
+from .utils import print_progress, format_time
 
 
 class CompanyGrouper:

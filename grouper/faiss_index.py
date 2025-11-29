@@ -3,7 +3,7 @@
 import numpy as np
 import faiss
 from typing import Tuple, Optional
-from grouper.utils import check_faiss_gpu, print_progress
+from .utils import check_faiss_gpu, print_progress
 
 
 class FAISSIndex:
