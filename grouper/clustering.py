@@ -18,8 +18,8 @@ def build_similarity_graph(
     
     Args:
         n_samples: Total number of samples
-        similarity_pairs: List of (idx1, idx2, similarity_score) tuples
-        threshold: Minimum similarity to create an edge
+        similarity_pairs: List of (idx1, idx2, similarity_score) tuples (already filtered by threshold)
+        threshold: Minimum similarity to create an edge (for logging)
         
     Returns:
         NetworkX graph with edges for similar pairs
@@ -27,14 +27,27 @@ def build_similarity_graph(
     graph = nx.Graph()
     graph.add_nodes_from(range(n_samples))
     
-    # Add edges for pairs above threshold
-    edges_added = 0
-    for idx1, idx2, similarity in similarity_pairs:
-        if similarity >= threshold and idx1 != idx2:
-            graph.add_edge(idx1, idx2, weight=similarity)
-            edges_added += 1
+    # Add edges - pairs are already filtered by threshold
+    # Use batch addition for better performance with large edge lists
+    # Process in chunks to avoid memory issues with very large graphs
+    chunk_size = 1000000  # Process 1M edges at a time
+    total_edges = 0
     
-    print_progress(f"Built graph with {edges_added} edges", True)
+    for i in range(0, len(similarity_pairs), chunk_size):
+        chunk = similarity_pairs[i:i + chunk_size]
+        edges_to_add = []
+        for idx1, idx2, similarity in chunk:
+            if idx1 != idx2:  # Skip self-loops
+                edges_to_add.append((idx1, idx2, {'weight': similarity}))
+        
+        if edges_to_add:
+            graph.add_edges_from(edges_to_add)
+            total_edges += len(edges_to_add)
+        
+        if len(similarity_pairs) > chunk_size:
+            print_progress(f"Added {min(i + chunk_size, len(similarity_pairs))}/{len(similarity_pairs)} edges...", True)
+    
+    print_progress(f"Built graph with {total_edges} edges", True)
     return graph
 
 
@@ -218,13 +231,22 @@ def cluster_companies(
                 # Add both directions, but we'll deduplicate in graph building
                 # The actual threshold filtering happens in build_similarity_graph
                 if global_idx < neighbor_idx:  # Only add once per pair
-                    similarity_pairs.append((global_idx, neighbor_idx, similarity))
+                    pair_key = (global_idx, neighbor_idx)
+                    if pair_key not in similarity_pairs_set:
+                        similarity_pairs_set.add(pair_key)
+                        similarity_pairs.append((global_idx, neighbor_idx, similarity))
     
-    print_progress(f"Found {len(similarity_pairs)} similar pairs", verbose)
+    print_progress(f"Found {len(similarity_pairs)} candidate pairs (before threshold filtering)", verbose)
+    
+    # Pre-filter pairs by threshold before building graph to reduce memory usage
+    # This is more efficient than filtering during graph construction
+    print_progress(f"Filtering {len(similarity_pairs)} pairs by threshold {threshold}...", verbose)
+    filtered_pairs = [(idx1, idx2, sim) for idx1, idx2, sim in similarity_pairs if sim >= threshold]
+    print_progress(f"Filtered to {len(filtered_pairs)} pairs above threshold {threshold}", verbose)
     
     # Build similarity graph
-    print_progress("Building similarity graph...", verbose)
-    graph = build_similarity_graph(n_samples, similarity_pairs, threshold)
+    print_progress(f"Building similarity graph with {len(filtered_pairs)} edges...", verbose)
+    graph = build_similarity_graph(n_samples, filtered_pairs, threshold)
     
     # Perform clustering
     print_progress(f"Clustering using {clustering_method}...", verbose)
