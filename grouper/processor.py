@@ -115,6 +115,14 @@ class CompanyGrouper:
         # Use larger batch size for search on very large datasets
         search_batch_size = min(5000, max(1000, n_samples // 500)) if n_samples > 100000 else 1000
         
+        # For very large datasets, increase top_k to find more neighbors
+        # This helps ensure similar companies aren't missed due to ranking
+        effective_top_k = self.top_k
+        if n_samples > 1000000 and self.top_k < 100:
+            effective_top_k = max(100, self.top_k)
+            if self.verbose:
+                print_progress(f"Increased top_k from {self.top_k} to {effective_top_k} for large dataset", self.verbose)
+        
         cluster_assignments, canonical_names, similarity_scores, neighbor_counts, cluster_sizes = cluster_companies(
             n_samples=n_samples,
             faiss_index=faiss_index,
@@ -122,7 +130,7 @@ class CompanyGrouper:
             original_names=company_names,
             normalized_names=normalized_names,
             threshold=self.threshold,
-            top_k=self.top_k,
+            top_k=effective_top_k,  # Use increased top_k for large datasets
             clustering_method=self.clustering_method,
             canonical_method=self.canonical_method,
             search_batch_size=search_batch_size,

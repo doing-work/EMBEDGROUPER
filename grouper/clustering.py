@@ -186,10 +186,14 @@ def cluster_companies(
         
         # Batch search for all companies in this batch
         batch_embeddings = embeddings[start_idx:end_idx]
+        # Use lower threshold for search to find more candidates
+        # The actual threshold will be applied when building the graph
+        # This ensures we don't miss similar companies that are just outside the strict threshold
+        search_threshold = max(0.70, threshold - 0.10)  # Lower threshold for search
         distances_batch, indices_batch = faiss_index.search(
             batch_embeddings,
             k=top_k,
-            threshold=threshold
+            threshold=search_threshold  # More permissive search to find candidates
         )
         
         # Process results for each company in the batch
@@ -207,8 +211,12 @@ def cluster_companies(
             neighbor_counts[global_idx] = len(valid_neighbors)
             
             # Add to similarity pairs
+            # Note: valid_neighbors may include pairs below the clustering threshold
+            # because we use a lower search_threshold to find candidates.
+            # The build_similarity_graph function will filter by the actual threshold.
             for neighbor_idx, similarity in valid_neighbors:
                 # Add both directions, but we'll deduplicate in graph building
+                # The actual threshold filtering happens in build_similarity_graph
                 if global_idx < neighbor_idx:  # Only add once per pair
                     similarity_pairs.append((global_idx, neighbor_idx, similarity))
     
