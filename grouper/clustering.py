@@ -1,7 +1,7 @@
 """Clustering algorithms for grouping similar company names."""
 
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 import networkx as nx
 from collections import Counter
 from tqdm import tqdm
@@ -178,8 +178,9 @@ def cluster_companies(
     print_progress(f"Finding similar pairs (threshold={threshold})...", verbose)
     
     # Find all similar pairs - batch processing for efficiency
-    similarity_pairs = []
-    neighbor_counts = {}
+    similarity_pairs: List[Tuple[int, int, float]] = []
+    similarity_pairs_set: Set[Tuple[int, int]] = set()
+    neighbor_counts: Dict[int, int] = {}
     
     # Process in batches for better performance
     # Use larger batches for very large datasets
