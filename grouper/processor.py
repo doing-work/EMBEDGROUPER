@@ -77,6 +77,9 @@ class CompanyGrouper:
         if column_name not in df.columns:
             raise ValueError(f"Column '{column_name}' not found in CSV. Available columns: {df.columns.tolist()}")
         
+        # Store original dataframe to preserve all columns
+        self.original_df = df.copy()
+        
         company_names = df[column_name].fillna("").astype(str).tolist()
         n_samples = len(company_names)
         print_progress(f"Loaded {n_samples} company names", self.verbose)
@@ -142,17 +145,16 @@ class CompanyGrouper:
         print_progress("Preparing output...", self.verbose)
         output_start = time.time()
         
-        # Create output dataframe
-        output_data = {
-            'original_name': company_names,
-            'cluster_id': [cluster_assignments.get(i, i) for i in range(n_samples)],
-            'canonical_name': [canonical_names.get(cluster_assignments.get(i, i), company_names[i]) for i in range(n_samples)],
-            'similarity_score_to_canonical': [similarity_scores.get(i, 1.0) for i in range(n_samples)],
-            'neighbor_count': [neighbor_counts.get(i, 0) for i in range(n_samples)],
-            'cluster_size': [cluster_sizes.get(cluster_assignments.get(i, i), 1) for i in range(n_samples)]
-        }
+        # Start with original dataframe to preserve all input columns
+        output_df = self.original_df.copy()
         
-        output_df = pd.DataFrame(output_data)
+        # Add clustering columns
+        output_df['cluster_id'] = [cluster_assignments.get(i, i) for i in range(n_samples)]
+        output_df['canonical_name'] = [canonical_names.get(cluster_assignments.get(i, i), company_names[i]) for i in range(n_samples)]
+        output_df['similarity_score_to_canonical'] = [similarity_scores.get(i, 1.0) for i in range(n_samples)]
+        output_df['neighbor_count'] = [neighbor_counts.get(i, 0) for i in range(n_samples)]
+        output_df['cluster_size'] = [cluster_sizes.get(cluster_assignments.get(i, i), 1) for i in range(n_samples)]
+        
         output_df.to_csv(output_file, index=False)
         self.timing_stats['output'] = time.time() - output_start
         
