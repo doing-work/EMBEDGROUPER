@@ -2,74 +2,35 @@
 
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Set
-import networkx as nx
 from collections import Counter
 from tqdm import tqdm
 from .utils import print_progress
 
 
-def build_similarity_graph(
-    n_samples: int,
-    similarity_pairs: List[Tuple[int, int, float]],
-    threshold: float = 0.85
-) -> nx.Graph:
-    """
-    Build a graph where nodes are companies and edges connect similar pairs.
-    
-    Args:
-        n_samples: Total number of samples
-        similarity_pairs: List of (idx1, idx2, similarity_score) tuples (already filtered by threshold)
-        threshold: Minimum similarity to create an edge (for logging)
-        
-    Returns:
-        NetworkX graph with edges for similar pairs
-    """
-    graph = nx.Graph()
-    graph.add_nodes_from(range(n_samples))
-    
-    # Add edges - pairs are already filtered by threshold
-    # Use batch addition for better performance with large edge lists
-    # Process in chunks to avoid memory issues with very large graphs
-    chunk_size = 1000000  # Process 1M edges at a time
-    total_edges = 0
-    
-    for i in range(0, len(similarity_pairs), chunk_size):
-        chunk = similarity_pairs[i:i + chunk_size]
-        edges_to_add = []
-        for idx1, idx2, similarity in chunk:
-            if idx1 != idx2:  # Skip self-loops
-                edges_to_add.append((idx1, idx2, {'weight': similarity}))
-        
-        if edges_to_add:
-            graph.add_edges_from(edges_to_add)
-            total_edges += len(edges_to_add)
-        
-        if len(similarity_pairs) > chunk_size:
-            print_progress(f"Added {min(i + chunk_size, len(similarity_pairs))}/{len(similarity_pairs)} edges...", True)
-    
-    print_progress(f"Built graph with {total_edges} edges", True)
-    return graph
+class UnionFind:
+    """Disjoint-set (Union-Find) structure for efficient clustering without storing all edges."""
 
+    def __init__(self, n: int):
+        self.parent = list(range(n))
+        self.rank = [0] * n
 
-def connected_components_clustering(graph: nx.Graph) -> Dict[int, int]:
-    """
-    Cluster nodes using connected components.
-    
-    Args:
-        graph: NetworkX graph
-        
-    Returns:
-        Dictionary mapping node index to cluster_id
-    """
-    clusters = {}
-    cluster_id = 0
-    
-    for component in nx.connected_components(graph):
-        for node in component:
-            clusters[node] = cluster_id
-        cluster_id += 1
-    
-    return clusters
+    def find(self, x: int) -> int:
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, x: int, y: int) -> None:
+        rx, ry = self.find(x), self.find(y)
+        if rx == ry:
+            return
+        if self.rank[rx] < self.rank[ry]:
+            self.parent[rx] = ry
+        elif self.rank[rx] > self.rank[ry]:
+            self.parent[ry] = rx
+        else:
+            self.parent[ry] = rx
+            self.rank[rx] += 1
 
 
 def select_canonical_name(
@@ -178,9 +139,9 @@ def cluster_companies(
     print_progress(f"Finding similar pairs (threshold={threshold})...", verbose)
     
     # Find all similar pairs - batch processing for efficiency
-    similarity_pairs: List[Tuple[int, int, float]] = []
-    similarity_pairs_set: Set[Tuple[int, int]] = set()
+    # We do NOT store all pairs; we stream through them and build clusters with UnionFind
     neighbor_counts: Dict[int, int] = {}
+    uf = UnionFind(n_samples)
     
     # Process in batches for better performance
     # Use larger batches for very large datasets
@@ -224,37 +185,24 @@ def cluster_companies(
             
             neighbor_counts[global_idx] = len(valid_neighbors)
             
-            # Add to similarity pairs
-            # Note: valid_neighbors may include pairs below the clustering threshold
-            # because we use a lower search_threshold to find candidates.
-            # The build_similarity_graph function will filter by the actual threshold.
+            # For clustering, only consider neighbors that meet the actual threshold
             for neighbor_idx, similarity in valid_neighbors:
-                # Add both directions, but we'll deduplicate in graph building
-                # The actual threshold filtering happens in build_similarity_graph
-                if global_idx < neighbor_idx:  # Only add once per pair
-                    pair_key = (global_idx, neighbor_idx)
-                    if pair_key not in similarity_pairs_set:
-                        similarity_pairs_set.add(pair_key)
-                        similarity_pairs.append((global_idx, neighbor_idx, similarity))
+                if similarity >= threshold and global_idx != neighbor_idx:
+                    uf.union(global_idx, neighbor_idx)
     
-    print_progress(f"Found {len(similarity_pairs)} candidate pairs (before threshold filtering)", verbose)
+    print_progress("Building clusters from UnionFind structure...", verbose)
     
-    # Pre-filter pairs by threshold before building graph to reduce memory usage
-    # This is more efficient than filtering during graph construction
-    print_progress(f"Filtering {len(similarity_pairs)} pairs by threshold {threshold}...", verbose)
-    filtered_pairs = [(idx1, idx2, sim) for idx1, idx2, sim in similarity_pairs if sim >= threshold]
-    print_progress(f"Filtered to {len(filtered_pairs)} pairs above threshold {threshold}", verbose)
+    # Assign cluster IDs based on UnionFind roots
+    cluster_assignments: Dict[int, int] = {}
+    root_to_cluster: Dict[int, int] = {}
+    next_cluster_id = 0
     
-    # Build similarity graph
-    print_progress(f"Building similarity graph with {len(filtered_pairs)} edges...", verbose)
-    graph = build_similarity_graph(n_samples, filtered_pairs, threshold)
-    
-    # Perform clustering
-    print_progress(f"Clustering using {clustering_method}...", verbose)
-    if clustering_method == "connected_components":
-        cluster_assignments = connected_components_clustering(graph)
-    else:
-        raise ValueError(f"Unknown clustering method: {clustering_method}")
+    for idx in range(n_samples):
+        root = uf.find(idx)
+        if root not in root_to_cluster:
+            root_to_cluster[root] = next_cluster_id
+            next_cluster_id += 1
+        cluster_assignments[idx] = root_to_cluster[root]
     
     # Group indices by cluster
     clusters_dict: Dict[int, List[int]] = {}
