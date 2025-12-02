@@ -179,6 +179,131 @@ def _build_cluster_assignments_from_unionfind(uf: UnionFind, n_samples: int, ver
     return cluster_assignments
 
 
+def _validate_and_split_cluster(
+    cluster_indices: List[int],
+    embeddings: np.ndarray,
+    threshold: float,
+    verbose: bool
+) -> Dict[int, int]:
+    """
+    Validate a cluster by checking if all pairs meet the threshold.
+    Split if validation fails (prevents transitive closure).
+    
+    Args:
+        cluster_indices: Indices of companies in the cluster
+        embeddings: All embeddings (n_samples, embedding_dim)
+        threshold: Similarity threshold
+        verbose: Whether to print progress
+        
+    Returns:
+        Dict mapping original index -> new sub-cluster ID (0 if valid, split IDs if invalid)
+    """
+    if len(cluster_indices) <= 1:
+        return {idx: 0 for idx in cluster_indices}
+    
+    # Extract embeddings for this cluster
+    cluster_embeddings = embeddings[cluster_indices]
+    n_cluster = len(cluster_indices)
+    
+    # For very large clusters, use centroid filtering (faster)
+    if n_cluster > 1000:
+        return _filter_cluster_by_centroid(cluster_indices, embeddings, threshold, verbose)
+    
+    # For smaller clusters, validate all pairs
+    # Compute pairwise similarities
+    similarities = np.dot(cluster_embeddings, cluster_embeddings.T)
+    np.fill_diagonal(similarities, 1.0)  # Ignore self-similarity
+    
+    # Check if any pair is below threshold
+    min_similarity = float(np.min(similarities))
+    
+    if min_similarity >= threshold:
+        # All pairs meet threshold - cluster is valid
+        return {idx: 0 for idx in cluster_indices}
+    
+    # Cluster failed validation - split it using stricter threshold
+    split_threshold = min(0.95, threshold + 0.05)
+    
+    # Build Union-Find with stricter threshold
+    uf = UnionFind(n_cluster)
+    
+    # Add edges only for pairs meeting stricter threshold
+    for i in range(n_cluster):
+        for j in range(i + 1, n_cluster):
+            similarity = similarities[i, j]
+            if similarity >= split_threshold:
+                uf.union(i, j)
+    
+    # Build sub-cluster assignments
+    sub_cluster_assignments: Dict[int, int] = {}
+    root_to_sub_cluster: Dict[int, int] = {}
+    next_sub_cluster_id = 0
+    
+    for local_idx in range(n_cluster):
+        root = uf.find(local_idx)
+        if root not in root_to_sub_cluster:
+            root_to_sub_cluster[root] = next_sub_cluster_id
+            next_sub_cluster_id += 1
+        sub_cluster_assignments[local_idx] = root_to_sub_cluster[root]
+    
+    # Map back to original indices
+    result = {cluster_indices[local_idx]: sub_cluster_id 
+              for local_idx, sub_cluster_id in sub_cluster_assignments.items()}
+    
+    if verbose and len(root_to_sub_cluster) > 1:
+        print_progress(f"Split invalid cluster of {n_cluster} members into {len(root_to_sub_cluster)} sub-clusters (min similarity: {min_similarity:.3f} < {threshold:.3f})", verbose)
+    
+    return result
+
+
+def _filter_cluster_by_centroid(
+    cluster_indices: List[int],
+    embeddings: np.ndarray,
+    threshold: float,
+    verbose: bool
+) -> Dict[int, int]:
+    """
+    Filter cluster members by similarity to centroid (for very large clusters).
+    Removes members that are too dissimilar from the cluster center.
+    """
+    if len(cluster_indices) <= 1:
+        return {idx: 0 for idx in cluster_indices}
+    
+    cluster_embeddings = embeddings[cluster_indices]
+    centroid = np.mean(cluster_embeddings, axis=0)
+    centroid = centroid / np.linalg.norm(centroid)  # Normalize
+    
+    # Compute similarities to centroid
+    similarities = np.dot(cluster_embeddings, centroid)
+    
+    # Keep only members similar to centroid
+    valid_mask = similarities >= threshold
+    valid_indices = [cluster_indices[i] for i in range(len(cluster_indices)) if valid_mask[i]]
+    
+    if len(valid_indices) == len(cluster_indices):
+        # All members are valid
+        return {idx: 0 for idx in cluster_indices}
+    
+    # Split: valid members stay together, invalid members become singletons
+    result = {}
+    next_sub_cluster_id = 0
+    
+    # Valid members get cluster 0
+    for idx in valid_indices:
+        result[idx] = 0
+    
+    # Invalid members become singletons
+    invalid_indices = [idx for idx in cluster_indices if idx not in valid_indices]
+    for idx in invalid_indices:
+        result[idx] = next_sub_cluster_id + 1
+        next_sub_cluster_id += 1
+    
+    if verbose:
+        print_progress(f"Filtered cluster: {len(valid_indices)}/{len(cluster_indices)} members remain (threshold: {threshold:.3f})", verbose)
+    
+    return result
+
+
 def _split_large_cluster(
     cluster_indices: List[int],
     embeddings: np.ndarray,
@@ -393,8 +518,56 @@ def cluster_companies(
             clusters_dict[cluster_id] = []
         clusters_dict[cluster_id].append(idx)
     
-    # Split large clusters to prevent transitive closure issues
+    # Validate clusters to prevent transitive closure issues
+    # This ensures all pairs in each cluster meet the threshold
     if max_cluster_size > 0:
+        print_progress("Validating clusters to prevent transitive closure...", verbose)
+        clusters_to_validate = list(clusters_dict.items())
+        next_cluster_id = max(cluster_assignments.values()) + 1
+        validation_count = 0
+        split_count = 0
+        
+        for original_cluster_id, cluster_indices in clusters_to_validate:
+            # Skip single-member clusters
+            if len(cluster_indices) <= 1:
+                continue
+            
+            # Validate cluster (checks if all pairs meet threshold)
+            validation_result = _validate_and_split_cluster(
+                cluster_indices,
+                embeddings,
+                threshold,
+                verbose
+            )
+            
+            validation_count += 1
+            
+            # Check if cluster was split
+            unique_sub_clusters = len(set(validation_result.values()))
+            
+            if unique_sub_clusters > 1:
+                # Cluster was split - update assignments
+                split_count += 1
+                max_sub_cluster_id = max(validation_result.values())
+                
+                for idx, sub_cluster_id in validation_result.items():
+                    new_cluster_id = next_cluster_id + sub_cluster_id
+                    cluster_assignments[idx] = new_cluster_id
+                
+                next_cluster_id += max_sub_cluster_id + 1
+        
+        if split_count > 0:
+            # Rebuild clusters_dict with validated/split clusters
+            clusters_dict = {}
+            for idx, cluster_id in cluster_assignments.items():
+                if cluster_id not in clusters_dict:
+                    clusters_dict[cluster_id] = []
+                clusters_dict[cluster_id].append(idx)
+            
+            print_progress(f"Validated {validation_count} clusters, split {split_count} invalid clusters", verbose)
+            print_progress(f"After validation: {len(clusters_dict)} clusters", verbose)
+        
+        # Also split clusters that are too large (size-based splitting)
         large_clusters = {cid: indices for cid, indices in clusters_dict.items() 
                          if len(indices) > max_cluster_size}
         
@@ -431,7 +604,7 @@ def cluster_companies(
                     clusters_dict[cluster_id] = []
                 clusters_dict[cluster_id].append(idx)
             
-            print_progress(f"After splitting: {len(clusters_dict)} clusters", verbose)
+            print_progress(f"After size-based splitting: {len(clusters_dict)} clusters", verbose)
     
     # Select canonical names for each cluster
     print_progress("Selecting canonical names...", verbose)
