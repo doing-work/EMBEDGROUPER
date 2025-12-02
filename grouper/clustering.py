@@ -120,10 +120,13 @@ def select_canonical_name(
 
 def _cluster_with_cugraph(n_samples: int, edges_list: List[Tuple[int, int]], verbose: bool) -> Dict[int, int]:
     """Build clusters using RAPIDS cuGraph connected components."""
-    # Create cuDF DataFrame from edges
-    src = [e[0] for e in edges_list]
-    dst = [e[1] for e in edges_list]
+    # Create cuDF DataFrame from edges - use numpy arrays for efficiency
+    # Convert to numpy first, then to cuDF to avoid Python list overhead
+    edges_array = np.array(edges_list, dtype=np.int32)
+    src = edges_array[:, 0]
+    dst = edges_array[:, 1]
     
+    # Create cuDF DataFrame directly from numpy arrays (more memory efficient)
     df = cudf.DataFrame({'src': src, 'dst': dst})
     
     # Create graph and find connected components
@@ -158,14 +161,8 @@ def _cluster_with_cugraph(n_samples: int, edges_list: List[Tuple[int, int]], ver
     return cluster_assignments
 
 
-def _cluster_with_unionfind(n_samples: int, edges_list: List[Tuple[int, int]], verbose: bool) -> Dict[int, int]:
-    """Build clusters using Union-Find (CPU fallback)."""
-    uf = UnionFind(n_samples)
-    
-    # Process edges
-    for src, dst in edges_list:
-        uf.union(src, dst)
-    
+def _build_cluster_assignments_from_unionfind(uf: UnionFind, n_samples: int, verbose: bool) -> Dict[int, int]:
+    """Build cluster assignments from an existing Union-Find structure."""
     # Assign cluster IDs based on UnionFind roots
     cluster_assignments: Dict[int, int] = {}
     root_to_cluster: Dict[int, int] = {}
@@ -180,6 +177,17 @@ def _cluster_with_unionfind(n_samples: int, edges_list: List[Tuple[int, int]], v
     
     print_progress(f"Found {len(root_to_cluster)} clusters using Union-Find", verbose)
     return cluster_assignments
+
+
+def _cluster_with_unionfind(n_samples: int, edges_list: List[Tuple[int, int]], verbose: bool) -> Dict[int, int]:
+    """Build clusters using Union-Find from edge list (for RAPIDS fallback)."""
+    uf = UnionFind(n_samples)
+    
+    # Process edges
+    for src, dst in edges_list:
+        uf.union(src, dst)
+    
+    return _build_cluster_assignments_from_unionfind(uf, n_samples, verbose)
 
 
 def cluster_companies(
@@ -221,8 +229,10 @@ def cluster_companies(
     print_progress(f"Finding similar pairs (threshold={threshold})...", verbose)
     
     # Find all similar pairs - batch processing for efficiency
+    # Use streaming Union-Find to avoid RAM issues (no edge list storage)
     neighbor_counts: Dict[int, int] = {}
-    edges_list: List[Tuple[int, int]] = []  # Store edges for graph building
+    uf = UnionFind(n_samples)  # Stream edges directly into Union-Find
+    edge_count = 0
     
     # Process in batches for better performance
     # Use larger batches for very large datasets
@@ -266,23 +276,16 @@ def cluster_companies(
             
             neighbor_counts[global_idx] = len(valid_neighbors)
             
-            # Collect edges that meet the actual threshold
+            # Stream edges directly into Union-Find (memory efficient - no edge storage)
             for neighbor_idx, similarity in valid_neighbors:
-                if similarity >= threshold and global_idx < neighbor_idx:  # Only add once per pair
-                    edges_list.append((global_idx, neighbor_idx))
+                if similarity >= threshold and global_idx != neighbor_idx:
+                    uf.union(global_idx, neighbor_idx)
+                    edge_count += 1
     
-    print_progress(f"Found {len(edges_list)} edges above threshold", verbose)
+    print_progress(f"Processed {edge_count:,} edges, building clusters...", verbose)
     
-    # Build clusters using RAPIDS cuGraph or Union-Find fallback
-    if RAPIDS_AVAILABLE and len(edges_list) > 0:
-        print_progress("Building clusters using RAPIDS cuGraph (GPU)...", verbose)
-        cluster_assignments = _cluster_with_cugraph(n_samples, edges_list, verbose)
-    else:
-        if not RAPIDS_AVAILABLE:
-            print_progress("Using Union-Find fallback (CPU)...", verbose)
-        else:
-            print_progress("No edges found, using Union-Find...", verbose)
-        cluster_assignments = _cluster_with_unionfind(n_samples, edges_list, verbose)
+    # Build cluster assignments from Union-Find structure
+    cluster_assignments = _build_cluster_assignments_from_unionfind(uf, n_samples, verbose)
     
     # Group indices by cluster
     clusters_dict: Dict[int, List[int]] = {}
