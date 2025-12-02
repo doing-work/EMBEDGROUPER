@@ -78,12 +78,21 @@ def select_canonical_name(
     
     elif method == "centroid":
         # Select name closest to cluster centroid
-        cluster_embeddings = embeddings[cluster_indices]
+        # For very large clusters, sample to speed up computation
+        if len(cluster_indices) > 10000:
+            # Sample up to 10K members for centroid computation
+            import random
+            sampled_indices = random.sample(cluster_indices, min(10000, len(cluster_indices)))
+            cluster_embeddings = embeddings[sampled_indices]
+        else:
+            cluster_embeddings = embeddings[cluster_indices]
+        
         centroid = np.mean(cluster_embeddings, axis=0)
         centroid = centroid / np.linalg.norm(centroid)  # Normalize
         
-        # Compute similarities to centroid
-        similarities = np.dot(cluster_embeddings, centroid)
+        # Compute similarities to centroid (use full cluster for final selection)
+        full_cluster_embeddings = embeddings[cluster_indices]
+        similarities = np.dot(full_cluster_embeddings, centroid)
         best_idx_in_cluster = np.argmax(similarities)
         canonical_idx = cluster_indices[best_idx_in_cluster]
         canonical_name = original_names[canonical_idx]
@@ -223,7 +232,17 @@ def cluster_companies(
         cluster_items = tqdm(cluster_items, desc="Selecting canonicals", unit="cluster")
     
     for cluster_id, cluster_indices in cluster_items:
-        cluster_sizes[cluster_id] = len(cluster_indices)
+        cluster_size = len(cluster_indices)
+        cluster_sizes[cluster_id] = cluster_size
+        
+        # Fast path for single-member clusters
+        if cluster_size == 1:
+            idx = cluster_indices[0]
+            canonical_names[cluster_id] = original_names[idx]
+            similarity_scores[idx] = 1.0
+            continue
+        
+        # Multi-member clusters
         canonical_name, canonical_idx, avg_sim = select_canonical_name(
             cluster_indices,
             original_names,
@@ -235,7 +254,7 @@ def cluster_companies(
         
         # Compute similarity to canonical for each member - BATCHED for performance
         canonical_embedding = embeddings[canonical_idx]
-        cluster_embeddings = embeddings[cluster_indices]  # Get all embeddings at once
+        cluster_embeddings = embeddings[cluster_indices]
         # Compute all similarities in one vectorized operation
         similarities = np.dot(cluster_embeddings, canonical_embedding)
         # Store all similarities at once
