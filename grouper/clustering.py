@@ -186,8 +186,9 @@ def _validate_and_split_cluster(
     verbose: bool
 ) -> Dict[int, int]:
     """
-    Validate a cluster by checking if all pairs meet the threshold.
+    Validate a cluster using average similarity and percentage of pairs meeting threshold.
     Split if validation fails (prevents transitive closure).
+    Uses a more lenient approach than requiring ALL pairs to meet threshold.
     
     Args:
         cluster_indices: Indices of companies in the cluster
@@ -205,20 +206,32 @@ def _validate_and_split_cluster(
     cluster_embeddings = embeddings[cluster_indices]
     n_cluster = len(cluster_indices)
     
+    # Use a more lenient threshold for validation (default: threshold - 0.05)
+    validation_threshold = max(0.70, threshold - 0.05)
+    
     # For very large clusters, use centroid filtering (faster)
     if n_cluster > 1000:
-        return _filter_cluster_by_centroid(cluster_indices, embeddings, threshold, verbose)
+        return _filter_cluster_by_centroid(cluster_indices, embeddings, validation_threshold, verbose)
     
-    # For smaller clusters, validate all pairs
+    # For smaller clusters, check average similarity and percentage of pairs
     # Compute pairwise similarities
     similarities = np.dot(cluster_embeddings, cluster_embeddings.T)
     np.fill_diagonal(similarities, 1.0)  # Ignore self-similarity
     
-    # Check if any pair is below threshold
+    # Calculate statistics
     min_similarity = float(np.min(similarities))
+    avg_similarity = float(np.mean(similarities))
     
-    if min_similarity >= threshold:
-        # All pairs meet threshold - cluster is valid
+    # Count pairs above threshold
+    pairs_above_threshold = np.sum(similarities >= threshold)
+    total_pairs = n_cluster * (n_cluster - 1) / 2
+    pct_above_threshold = pairs_above_threshold / total_pairs if total_pairs > 0 else 1.0
+    
+    # Cluster is valid if:
+    # - Average similarity is above validation threshold (more lenient), OR
+    # - At least 80% of pairs meet the original threshold
+    if avg_similarity >= validation_threshold or pct_above_threshold >= 0.80:
+        # Cluster is valid
         return {idx: 0 for idx in cluster_indices}
     
     # Cluster failed validation - split it using stricter threshold
@@ -251,7 +264,7 @@ def _validate_and_split_cluster(
               for local_idx, sub_cluster_id in sub_cluster_assignments.items()}
     
     if verbose and len(root_to_sub_cluster) > 1:
-        print_progress(f"Split invalid cluster of {n_cluster} members into {len(root_to_sub_cluster)} sub-clusters (min similarity: {min_similarity:.3f} < {threshold:.3f})", verbose)
+        print_progress(f"Split invalid cluster of {n_cluster} members into {len(root_to_sub_cluster)} sub-clusters (avg similarity: {avg_similarity:.3f}, min: {min_similarity:.3f} < {validation_threshold:.3f})", verbose)
     
     return result
 
@@ -265,6 +278,7 @@ def _filter_cluster_by_centroid(
     """
     Filter cluster members by similarity to centroid (for very large clusters).
     Removes members that are too dissimilar from the cluster center.
+    Uses a more lenient threshold for very large clusters.
     """
     if len(cluster_indices) <= 1:
         return {idx: 0 for idx in cluster_indices}
@@ -273,11 +287,18 @@ def _filter_cluster_by_centroid(
     centroid = np.mean(cluster_embeddings, axis=0)
     centroid = centroid / np.linalg.norm(centroid)  # Normalize
     
+    # Use a more lenient threshold for centroid filtering of large clusters
+    # For very large clusters (>10K), allow more variation
+    if len(cluster_indices) > 10000:
+        centroid_threshold = max(0.70, threshold - 0.10)
+    else:
+        centroid_threshold = max(0.75, threshold - 0.05)
+    
     # Compute similarities to centroid
     similarities = np.dot(cluster_embeddings, centroid)
     
-    # Keep only members similar to centroid
-    valid_mask = similarities >= threshold
+    # Keep only members similar to centroid (using lenient threshold)
+    valid_mask = similarities >= centroid_threshold
     valid_indices = [cluster_indices[i] for i in range(len(cluster_indices)) if valid_mask[i]]
     
     if len(valid_indices) == len(cluster_indices):
@@ -299,7 +320,7 @@ def _filter_cluster_by_centroid(
         next_sub_cluster_id += 1
     
     if verbose:
-        print_progress(f"Filtered cluster: {len(valid_indices)}/{len(cluster_indices)} members remain (threshold: {threshold:.3f})", verbose)
+        print_progress(f"Filtered cluster: {len(valid_indices)}/{len(cluster_indices)} members remain (centroid threshold: {centroid_threshold:.3f})", verbose)
     
     return result
 
@@ -472,11 +493,13 @@ def cluster_companies(
             
             # Count valid neighbors (excluding self and -1 padding)
             # Filter by search_threshold first (FAISS already filtered, but double-check)
+            # Add explicit checks to prevent self-matches
             valid_neighbors = [
                 (int(indices[j]), float(distances[j]))
                 for j in range(len(indices))
                 if indices[j] != -1 
-                and indices[j] != global_idx
+                and int(indices[j]) != int(global_idx)  # Explicit self-match prevention
+                and 0 <= int(indices[j]) < n_samples  # Ensure valid index range
                 and distances[j] >= search_threshold  # Ensure above search threshold
             ]
             
