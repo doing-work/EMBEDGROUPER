@@ -1,10 +1,19 @@
 """Clustering algorithms for grouping similar company names."""
 
 import numpy as np
+import random
 from typing import Dict, List, Tuple, Optional, Set
 from collections import Counter
 from tqdm import tqdm
 from .utils import print_progress
+
+# Try to import RAPIDS cuGraph, fallback to Union-Find if not available
+try:
+    import cudf
+    import cugraph
+    RAPIDS_AVAILABLE = True
+except ImportError:
+    RAPIDS_AVAILABLE = False
 
 
 class UnionFind:
@@ -109,6 +118,70 @@ def select_canonical_name(
     return canonical_name, canonical_idx, avg_similarity
 
 
+def _cluster_with_cugraph(n_samples: int, edges_list: List[Tuple[int, int]], verbose: bool) -> Dict[int, int]:
+    """Build clusters using RAPIDS cuGraph connected components."""
+    # Create cuDF DataFrame from edges
+    src = [e[0] for e in edges_list]
+    dst = [e[1] for e in edges_list]
+    
+    df = cudf.DataFrame({'src': src, 'dst': dst})
+    
+    # Create graph and find connected components
+    G = cugraph.Graph()
+    G.from_cudf_edgelist(df, source='src', destination='dst', renumber=False)
+    
+    # Get connected components
+    components = cugraph.connected_components(G)
+    
+    # Convert to dictionary mapping node -> cluster_id
+    cluster_assignments = {}
+    # cuGraph returns labels, we need to map them to sequential cluster IDs
+    labels = components['labels'].to_pandas().values
+    vertices = components['vertex'].to_pandas().values
+    
+    # Map labels to sequential cluster IDs
+    unique_labels = {}
+    next_cluster_id = 0
+    for vertex, label in zip(vertices, labels):
+        if label not in unique_labels:
+            unique_labels[label] = next_cluster_id
+            next_cluster_id += 1
+        cluster_assignments[int(vertex)] = unique_labels[label]
+    
+    # Assign cluster IDs to all nodes (including isolated ones)
+    for i in range(n_samples):
+        if i not in cluster_assignments:
+            cluster_assignments[i] = next_cluster_id
+            next_cluster_id += 1
+    
+    print_progress(f"Found {len(unique_labels)} clusters using cuGraph", verbose)
+    return cluster_assignments
+
+
+def _cluster_with_unionfind(n_samples: int, edges_list: List[Tuple[int, int]], verbose: bool) -> Dict[int, int]:
+    """Build clusters using Union-Find (CPU fallback)."""
+    uf = UnionFind(n_samples)
+    
+    # Process edges
+    for src, dst in edges_list:
+        uf.union(src, dst)
+    
+    # Assign cluster IDs based on UnionFind roots
+    cluster_assignments: Dict[int, int] = {}
+    root_to_cluster: Dict[int, int] = {}
+    next_cluster_id = 0
+    
+    for idx in range(n_samples):
+        root = uf.find(idx)
+        if root not in root_to_cluster:
+            root_to_cluster[root] = next_cluster_id
+            next_cluster_id += 1
+        cluster_assignments[idx] = root_to_cluster[root]
+    
+    print_progress(f"Found {len(root_to_cluster)} clusters using Union-Find", verbose)
+    return cluster_assignments
+
+
 def cluster_companies(
     n_samples: int,
     faiss_index,
@@ -148,9 +221,8 @@ def cluster_companies(
     print_progress(f"Finding similar pairs (threshold={threshold})...", verbose)
     
     # Find all similar pairs - batch processing for efficiency
-    # We do NOT store all pairs; we stream through them and build clusters with UnionFind
     neighbor_counts: Dict[int, int] = {}
-    uf = UnionFind(n_samples)
+    edges_list: List[Tuple[int, int]] = []  # Store edges for graph building
     
     # Process in batches for better performance
     # Use larger batches for very large datasets
@@ -194,24 +266,23 @@ def cluster_companies(
             
             neighbor_counts[global_idx] = len(valid_neighbors)
             
-            # For clustering, only consider neighbors that meet the actual threshold
+            # Collect edges that meet the actual threshold
             for neighbor_idx, similarity in valid_neighbors:
-                if similarity >= threshold and global_idx != neighbor_idx:
-                    uf.union(global_idx, neighbor_idx)
+                if similarity >= threshold and global_idx < neighbor_idx:  # Only add once per pair
+                    edges_list.append((global_idx, neighbor_idx))
     
-    print_progress("Building clusters from UnionFind structure...", verbose)
+    print_progress(f"Found {len(edges_list)} edges above threshold", verbose)
     
-    # Assign cluster IDs based on UnionFind roots
-    cluster_assignments: Dict[int, int] = {}
-    root_to_cluster: Dict[int, int] = {}
-    next_cluster_id = 0
-    
-    for idx in range(n_samples):
-        root = uf.find(idx)
-        if root not in root_to_cluster:
-            root_to_cluster[root] = next_cluster_id
-            next_cluster_id += 1
-        cluster_assignments[idx] = root_to_cluster[root]
+    # Build clusters using RAPIDS cuGraph or Union-Find fallback
+    if RAPIDS_AVAILABLE and len(edges_list) > 0:
+        print_progress("Building clusters using RAPIDS cuGraph (GPU)...", verbose)
+        cluster_assignments = _cluster_with_cugraph(n_samples, edges_list, verbose)
+    else:
+        if not RAPIDS_AVAILABLE:
+            print_progress("Using Union-Find fallback (CPU)...", verbose)
+        else:
+            print_progress("No edges found, using Union-Find...", verbose)
+        cluster_assignments = _cluster_with_unionfind(n_samples, edges_list, verbose)
     
     # Group indices by cluster
     clusters_dict: Dict[int, List[int]] = {}
