@@ -152,4 +152,64 @@ class FAISSIndex:
         
         # Return 1D arrays
         return distances[0], indices[0]
+    
+    def save_to_disk(self, index_path: str):
+        """Save FAISS index to disk."""
+        # Save the CPU index (GPU index can be reconstructed)
+        index_to_save = self.index
+        faiss.write_index(index_to_save, index_path)
+        print_progress(f"Saved FAISS index to {index_path}", self.verbose)
+    
+    @classmethod
+    def load_from_disk(
+        cls, 
+        index_path: str, 
+        dimension: int,
+        n_samples: int,
+        index_type: str = "auto",
+        use_gpu: Optional[bool] = None,
+        verbose: bool = True
+    ):
+        """
+        Load FAISS index from disk.
+        
+        Args:
+            index_path: Path to saved FAISS index file
+            dimension: Embedding dimension
+            n_samples: Number of samples in the index
+            index_type: Type of index (for compatibility)
+            use_gpu: Whether to use GPU (auto-detect if None)
+            verbose: Whether to print progress messages
+            
+        Returns:
+            FAISSIndex instance
+        """
+        print_progress(f"Loading FAISS index from {index_path}...", verbose)
+        index = faiss.read_index(index_path)
+        
+        # Auto-detect GPU
+        if use_gpu is None:
+            use_gpu = check_faiss_gpu() and n_samples > 100000
+        
+        instance = cls.__new__(cls)
+        instance.index = index
+        instance.dimension = dimension
+        instance.n_samples = n_samples
+        instance.verbose = verbose
+        instance.index_type = index_type
+        instance.use_gpu = use_gpu
+        instance.embeddings = None  # Not stored, will be loaded separately
+        
+        # Move to GPU if requested and available
+        if use_gpu and check_faiss_gpu():
+            print_progress("Moving index to GPU...", verbose)
+            instance.gpu_resources = faiss.StandardGpuResources()
+            instance.gpu_index = faiss.index_cpu_to_gpu(instance.gpu_resources, 0, index)
+            print_progress("Index moved to GPU", verbose)
+        else:
+            instance.gpu_index = None
+            instance.gpu_resources = None
+            print_progress("Using CPU index", verbose)
+        
+        return instance
 

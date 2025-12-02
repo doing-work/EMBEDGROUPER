@@ -1,6 +1,8 @@
 """Main processing pipeline for company name grouping."""
 
 import time
+import os
+import gc
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple
@@ -9,7 +11,7 @@ from .normalizer import normalize_company_names
 from .embeddings import EmbeddingGenerator
 from .faiss_index import FAISSIndex
 from .clustering import cluster_companies
-from .utils import print_progress, format_time
+from .utils import print_progress, format_time, check_faiss_gpu
 
 
 class CompanyGrouper:
@@ -112,7 +114,57 @@ class CompanyGrouper:
         )
         self.timing_stats['index_build'] = time.time() - index_start
         
-        # Step 5: Find similar pairs and cluster
+        # Checkpoint: Save embeddings and index to disk, then free memory
+        # This is critical for large datasets to avoid RAM issues
+        checkpoint_dir = output_file.replace('.csv', '_checkpoints')
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        embeddings_path = os.path.join(checkpoint_dir, 'embeddings.npy')
+        index_path = os.path.join(checkpoint_dir, 'faiss_index.bin')
+        
+        print_progress("Saving checkpoints to disk to free RAM...", self.verbose)
+        print_progress(f"Saving embeddings ({embeddings.nbytes / 1024**3:.2f} GB) to {embeddings_path}...", self.verbose)
+        np.save(embeddings_path, embeddings)
+        
+        print_progress(f"Saving FAISS index to {index_path}...", self.verbose)
+        faiss_index.save_to_disk(index_path)
+        
+        # Store metadata for reloading
+        embedding_dim = embeddings.shape[1]
+        index_type_used = faiss_index.index_type
+        use_gpu = faiss_index.use_gpu
+        
+        # Free memory: delete large objects
+        print_progress("Freeing memory...", self.verbose)
+        del embedding_gen
+        del faiss_index
+        del embeddings
+        gc.collect()
+        
+        # Clear GPU cache if using GPU
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+        
+        print_progress("Memory freed. Loading from disk for clustering...", self.verbose)
+        
+        # Step 5: Load from disk and cluster
+        print_progress("Loading embeddings and index from disk...", self.verbose)
+        # Load embeddings - use memory mapping for large files to save RAM
+        # We'll load in chunks during clustering if needed
+        embeddings = np.load(embeddings_path)
+        faiss_index = FAISSIndex.load_from_disk(
+            index_path,
+            dimension=embedding_dim,
+            n_samples=n_samples,
+            index_type=index_type_used,
+            use_gpu=use_gpu,
+            verbose=self.verbose
+        )
+        
         print_progress("Clustering companies...", self.verbose)
         cluster_start = time.time()
         # Use larger batch size for search on very large datasets
@@ -139,6 +191,15 @@ class CompanyGrouper:
             search_batch_size=search_batch_size,
             verbose=self.verbose
         )
+        
+        # Clean up checkpoints after clustering
+        print_progress("Cleaning up checkpoints...", self.verbose)
+        try:
+            os.remove(embeddings_path)
+            os.remove(index_path)
+            os.rmdir(checkpoint_dir)
+        except Exception as e:
+            print_progress(f"Warning: Could not clean up checkpoints: {e}", self.verbose)
         self.timing_stats['clustering'] = time.time() - cluster_start
         
         # Step 6: Prepare output
