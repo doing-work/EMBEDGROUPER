@@ -179,6 +179,82 @@ def _build_cluster_assignments_from_unionfind(uf: UnionFind, n_samples: int, ver
     return cluster_assignments
 
 
+def _split_large_cluster(
+    cluster_indices: List[int],
+    embeddings: np.ndarray,
+    threshold: float,
+    max_cluster_size: int,
+    verbose: bool
+) -> Dict[int, int]:
+    """
+    Split a large cluster into smaller sub-clusters by re-clustering with stricter criteria.
+    
+    Args:
+        cluster_indices: Indices of companies in the large cluster
+        embeddings: All embeddings (n_samples, embedding_dim)
+        threshold: Similarity threshold (use stricter threshold for splitting)
+        max_cluster_size: Maximum allowed cluster size
+        verbose: Whether to print progress
+        
+    Returns:
+        Dict mapping original cluster index -> new sub-cluster ID
+    """
+    if len(cluster_indices) <= max_cluster_size:
+        # Cluster is already small enough
+        return {idx: 0 for idx in cluster_indices}
+    
+    # Use stricter threshold for splitting (add 0.05 to original threshold)
+    split_threshold = min(0.95, threshold + 0.05)
+    
+    # Extract embeddings for this cluster
+    cluster_embeddings = embeddings[cluster_indices]
+    
+    # Build a mini Union-Find for this cluster
+    n_cluster = len(cluster_indices)
+    uf = UnionFind(n_cluster)
+    
+    # Compute pairwise similarities and add edges
+    # Use batch processing to avoid memory issues
+    batch_size = min(1000, n_cluster)
+    edges_added = 0
+    
+    for i in range(0, n_cluster, batch_size):
+        end_i = min(i + batch_size, n_cluster)
+        batch_embeddings = cluster_embeddings[i:end_i]
+        
+        # Compute similarities to all other cluster members
+        similarities = np.dot(batch_embeddings, cluster_embeddings.T)
+        
+        for local_i, global_i in enumerate(range(i, end_i)):
+            for local_j, global_j in enumerate(range(n_cluster)):
+                if global_i < global_j:  # Only add each edge once
+                    similarity = similarities[local_i, local_j]
+                    if similarity >= split_threshold:
+                        uf.union(global_i, global_j)
+                        edges_added += 1
+    
+    # Build sub-cluster assignments
+    sub_cluster_assignments: Dict[int, int] = {}
+    root_to_sub_cluster: Dict[int, int] = {}
+    next_sub_cluster_id = 0
+    
+    for local_idx in range(n_cluster):
+        root = uf.find(local_idx)
+        if root not in root_to_sub_cluster:
+            root_to_sub_cluster[root] = next_sub_cluster_id
+            next_sub_cluster_id += 1
+        sub_cluster_assignments[local_idx] = root_to_sub_cluster[root]
+    
+    # Map back to original indices
+    result = {cluster_indices[local_idx]: sub_cluster_id 
+              for local_idx, sub_cluster_id in sub_cluster_assignments.items()}
+    
+    if verbose and len(root_to_sub_cluster) > 1:
+        print_progress(f"Split cluster of {n_cluster} members into {len(root_to_sub_cluster)} sub-clusters (threshold={split_threshold:.2f})", verbose)
+    
+    return result
+
+
 def _cluster_with_unionfind(n_samples: int, edges_list: List[Tuple[int, int]], verbose: bool) -> Dict[int, int]:
     """Build clusters using Union-Find from edge list (for RAPIDS fallback)."""
     uf = UnionFind(n_samples)
@@ -201,6 +277,7 @@ def cluster_companies(
     clustering_method: str = "connected_components",
     canonical_method: str = "longest",
     search_batch_size: int = 1000,
+    max_cluster_size: int = 1000,
     verbose: bool = True
 ) -> Tuple[Dict[int, int], Dict[int, str], Dict[int, float], Dict[int, int], Dict[int, int]]:
     """
@@ -216,6 +293,7 @@ def cluster_companies(
         top_k: Number of neighbors to retrieve per company
         clustering_method: Clustering algorithm ('connected_components')
         canonical_method: Method to select canonical name
+        max_cluster_size: Maximum cluster size before splitting (default: 1000)
         verbose: Whether to print progress
         
     Returns:
@@ -268,21 +346,42 @@ def cluster_companies(
             indices = indices_batch[local_idx]
             
             # Count valid neighbors (excluding self and -1 padding)
+            # Filter by search_threshold first (FAISS already filtered, but double-check)
             valid_neighbors = [
                 (int(indices[j]), float(distances[j]))
                 for j in range(len(indices))
-                if indices[j] != -1 and indices[j] != global_idx
+                if indices[j] != -1 
+                and indices[j] != global_idx
+                and distances[j] >= search_threshold  # Ensure above search threshold
             ]
             
             neighbor_counts[global_idx] = len(valid_neighbors)
             
             # Stream edges directly into Union-Find (memory efficient - no edge storage)
+            # Only add edges where global_idx < neighbor_idx to ensure each edge is added exactly once
+            # Apply the actual clustering threshold (stricter than search threshold)
+            edges_added_this_batch = 0
             for neighbor_idx, similarity in valid_neighbors:
-                if similarity >= threshold and global_idx != neighbor_idx:
+                # Only add if similarity meets the actual threshold AND we haven't processed this pair yet
+                if similarity >= threshold and global_idx < neighbor_idx:
                     uf.union(global_idx, neighbor_idx)
                     edge_count += 1
+                    edges_added_this_batch += 1
+            
+            # Debug: log if we're adding too many edges
+            if verbose and edges_added_this_batch > 100:
+                print_progress(f"Warning: Added {edges_added_this_batch} edges for company {global_idx} (may indicate low threshold)", verbose)
     
-    print_progress(f"Processed {edge_count:,} edges, building clusters...", verbose)
+    print_progress(f"Processed {edge_count:,} edges above threshold {threshold}, building clusters...", verbose)
+    
+    # Debug: Check if we have too many edges (which would cause giant clusters)
+    avg_edges_per_node = edge_count / n_samples if n_samples > 0 else 0
+    if avg_edges_per_node > 5:
+        print_progress(f"Warning: High average edges per node ({avg_edges_per_node:.2f}). This may cause large clusters.", verbose)
+        print_progress(f"Consider increasing threshold (current: {threshold}) or reducing top_k (current: {top_k})", verbose)
+    
+    if edge_count == 0:
+        print_progress("Warning: No edges found above threshold. All companies will be in separate clusters.", verbose)
     
     # Build cluster assignments from Union-Find structure
     cluster_assignments = _build_cluster_assignments_from_unionfind(uf, n_samples, verbose)
@@ -293,6 +392,46 @@ def cluster_companies(
         if cluster_id not in clusters_dict:
             clusters_dict[cluster_id] = []
         clusters_dict[cluster_id].append(idx)
+    
+    # Split large clusters to prevent transitive closure issues
+    if max_cluster_size > 0:
+        large_clusters = {cid: indices for cid, indices in clusters_dict.items() 
+                         if len(indices) > max_cluster_size}
+        
+        if large_clusters:
+            print_progress(f"Splitting {len(large_clusters)} large clusters (max size: {max_cluster_size})...", verbose)
+            next_cluster_id = max(cluster_assignments.values()) + 1
+            
+            for original_cluster_id, cluster_indices in large_clusters.items():
+                # Split the large cluster
+                split_assignments = _split_large_cluster(
+                    cluster_indices,
+                    embeddings,
+                    threshold,
+                    max_cluster_size,
+                    verbose
+                )
+                
+                # Get the maximum sub-cluster ID from this split
+                max_sub_cluster_id = max(split_assignments.values()) if split_assignments else 0
+                
+                # Update cluster assignments with new sub-cluster IDs
+                for idx, sub_cluster_id in split_assignments.items():
+                    # Assign new cluster ID (offset by next_cluster_id)
+                    new_cluster_id = next_cluster_id + sub_cluster_id
+                    cluster_assignments[idx] = new_cluster_id
+                
+                # Update next_cluster_id to avoid collisions
+                next_cluster_id += max_sub_cluster_id + 1
+            
+            # Rebuild clusters_dict with updated assignments
+            clusters_dict = {}
+            for idx, cluster_id in cluster_assignments.items():
+                if cluster_id not in clusters_dict:
+                    clusters_dict[cluster_id] = []
+                clusters_dict[cluster_id].append(idx)
+            
+            print_progress(f"After splitting: {len(clusters_dict)} clusters", verbose)
     
     # Select canonical names for each cluster
     print_progress("Selecting canonical names...", verbose)

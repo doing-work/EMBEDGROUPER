@@ -108,6 +108,13 @@ Examples:
     )
     
     parser.add_argument(
+        '--max-cluster-size',
+        type=int,
+        default=1000,
+        help='Maximum cluster size before splitting large clusters (default: 1000, set to 0 to disable splitting)'
+    )
+    
+    parser.add_argument(
         '--quiet',
         action='store_true',
         help='Suppress progress messages'
@@ -129,6 +136,7 @@ Examples:
         index_type=args.index_type,
         clustering_method=args.clustering,
         canonical_method=args.canonical_method,
+        max_cluster_size=args.max_cluster_size,
         verbose=not args.quiet
     )
     

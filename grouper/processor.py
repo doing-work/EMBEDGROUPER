@@ -26,6 +26,7 @@ class CompanyGrouper:
         index_type: str = "auto",
         clustering_method: str = "connected_components",
         canonical_method: str = "longest",
+        max_cluster_size: int = 1000,
         verbose: bool = True
     ):
         """
@@ -39,6 +40,7 @@ class CompanyGrouper:
             index_type: FAISS index type
             clustering_method: Clustering algorithm
             canonical_method: Method to select canonical names
+            max_cluster_size: Maximum cluster size before splitting (default: 1000)
             verbose: Whether to print progress
         """
         self.model_name = model_name
@@ -48,6 +50,7 @@ class CompanyGrouper:
         self.index_type = index_type
         self.clustering_method = clustering_method
         self.canonical_method = canonical_method
+        self.max_cluster_size = max_cluster_size
         self.verbose = verbose
         
         self.timing_stats = {}
@@ -189,6 +192,7 @@ class CompanyGrouper:
             clustering_method=self.clustering_method,
             canonical_method=self.canonical_method,
             search_batch_size=search_batch_size,
+            max_cluster_size=self.max_cluster_size,
             verbose=self.verbose
         )
         
