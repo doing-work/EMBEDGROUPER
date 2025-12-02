@@ -47,12 +47,16 @@ class FAISSIndex:
         
         # Auto-select index type if needed
         if self.index_type == "auto":
-            if self.n_samples < 2000000:
+            if self.n_samples < 500000:
                 # Use flat index for smaller datasets (exact search)
                 index_type_actual = "flat"
-            else:
-                # Use HNSW for larger datasets (approximate search)
+            elif self.n_samples < 2000000:
+                # Use HNSW for medium-large datasets (better recall than IVF)
                 index_type_actual = "hnsw"
+            else:
+                # Use IVF for very large datasets (>2M) for memory efficiency
+                # Note: HNSW has better recall but uses more memory
+                index_type_actual = "ivf"
         else:
             index_type_actual = self.index_type
         
@@ -66,14 +70,31 @@ class FAISSIndex:
             # HNSW index for approximate nearest neighbor search
             # M=32 is a good default for balance between accuracy and speed
             self.index = faiss.IndexHNSWFlat(self.dimension, 32)
-            # Set ef_construction for better recall (default is 200)
-            self.index.hnsw.efConstruction = 200
+            # Set ef_construction for better recall
+            # For very large datasets, increase ef_construction for better quality
+            if self.n_samples > 1000000:
+                self.index.hnsw.efConstruction = 300  # Higher quality for large datasets
+            else:
+                self.index.hnsw.efConstruction = 200  # Default
+            # Set ef_search for query time (will be set per query, but set default)
+            if hasattr(self.index.hnsw, 'efSearch'):
+                self.index.hnsw.efSearch = min(200, self.n_samples // 10000) if self.n_samples > 100000 else 100
         elif index_type_actual == "ivf":
             # IVF index for very large datasets
             nlist = min(4096, int(np.sqrt(self.n_samples)))  # Number of clusters
             quantizer = faiss.IndexFlatIP(self.dimension)
             self.index = faiss.IndexIVFFlat(quantizer, self.dimension, nlist)
-            self.index.nprobe = min(32, nlist // 4)  # Number of clusters to search
+            # Increase nprobe for very large datasets to improve recall
+            # For 1M+ records, search more clusters to find similar companies
+            if self.n_samples > 1000000:
+                # Search up to 50% of clusters for better recall
+                self.index.nprobe = min(128, max(64, nlist // 2))
+            elif self.n_samples > 500000:
+                # Search more clusters for medium-large datasets
+                self.index.nprobe = min(64, max(32, nlist // 3))
+            else:
+                self.index.nprobe = min(32, nlist // 4)  # Default
+            print_progress(f"IVF nprobe set to {self.index.nprobe} (searches {self.index.nprobe}/{nlist} clusters)", self.verbose)
         else:
             raise ValueError(f"Unknown index type: {index_type_actual}")
         

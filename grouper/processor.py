@@ -176,10 +176,20 @@ class CompanyGrouper:
         # For very large datasets, increase top_k to find more neighbors
         # This helps ensure similar companies aren't missed due to ranking
         effective_top_k = self.top_k
-        if n_samples > 1000000 and self.top_k < 100:
+        if n_samples > 1000000:
+            # For 1M+ records, significantly increase top_k for better coverage
+            effective_top_k = max(200, self.top_k * 2)
+            if self.verbose:
+                print_progress(f"Increased top_k from {self.top_k} to {effective_top_k} for very large dataset (1M+ records)", self.verbose)
+        elif n_samples > 500000:
+            # For 500K-1M records, moderately increase top_k
+            effective_top_k = max(150, int(self.top_k * 1.5))
+            if self.verbose:
+                print_progress(f"Increased top_k from {self.top_k} to {effective_top_k} for large dataset (500K-1M records)", self.verbose)
+        elif n_samples > 100000 and self.top_k < 100:
             effective_top_k = max(100, self.top_k)
             if self.verbose:
-                print_progress(f"Increased top_k from {self.top_k} to {effective_top_k} for large dataset", self.verbose)
+                print_progress(f"Increased top_k from {self.top_k} to {effective_top_k} for medium dataset", self.verbose)
         
         cluster_assignments, canonical_names, similarity_scores, neighbor_counts, cluster_sizes = cluster_companies(
             n_samples=n_samples,

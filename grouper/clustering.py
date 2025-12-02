@@ -478,8 +478,16 @@ def cluster_companies(
         batch_embeddings = embeddings[start_idx:end_idx]
         # Use lower threshold for search to find more candidates
         # The actual threshold will be applied when building the graph
-        # This ensures we don't miss similar companies that are just outside the strict threshold
-        search_threshold = max(0.70, threshold - 0.10)  # Lower threshold for search
+        # For very large datasets, use more permissive search threshold to improve recall
+        if n_samples > 1000000:
+            # More permissive for 1M+ records to account for approximate search limitations
+            search_threshold = max(0.65, threshold - 0.15)
+        elif n_samples > 500000:
+            # Moderately permissive for 500K-1M records
+            search_threshold = max(0.68, threshold - 0.12)
+        else:
+            # Default for smaller datasets
+            search_threshold = max(0.70, threshold - 0.10)
         distances_batch, indices_batch = faiss_index.search(
             batch_embeddings,
             k=top_k,
