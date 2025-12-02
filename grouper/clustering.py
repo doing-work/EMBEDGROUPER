@@ -217,7 +217,12 @@ def cluster_companies(
     similarity_scores = {}
     cluster_sizes = {}
     
-    for cluster_id, cluster_indices in clusters_dict.items():
+    # Add progress tracking for large numbers of clusters
+    cluster_items = clusters_dict.items()
+    if verbose and len(clusters_dict) > 1000:
+        cluster_items = tqdm(cluster_items, desc="Selecting canonicals", unit="cluster")
+    
+    for cluster_id, cluster_indices in cluster_items:
         cluster_sizes[cluster_id] = len(cluster_indices)
         canonical_name, canonical_idx, avg_sim = select_canonical_name(
             cluster_indices,
@@ -228,11 +233,14 @@ def cluster_companies(
         )
         canonical_names[cluster_id] = canonical_name
         
-        # Compute similarity to canonical for each member
+        # Compute similarity to canonical for each member - BATCHED for performance
         canonical_embedding = embeddings[canonical_idx]
-        for idx in cluster_indices:
-            similarity = float(np.dot(embeddings[idx], canonical_embedding))
-            similarity_scores[idx] = similarity
+        cluster_embeddings = embeddings[cluster_indices]  # Get all embeddings at once
+        # Compute all similarities in one vectorized operation
+        similarities = np.dot(cluster_embeddings, canonical_embedding)
+        # Store all similarities at once
+        for idx, similarity in zip(cluster_indices, similarities):
+            similarity_scores[idx] = float(similarity)
     
     print_progress(f"Created {len(clusters_dict)} clusters", verbose)
     
