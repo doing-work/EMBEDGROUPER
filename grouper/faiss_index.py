@@ -1,9 +1,106 @@
 """FAISS index building and approximate nearest neighbor search."""
 
 import numpy as np
-import faiss
+try:
+    import faiss
+except ImportError:
+    raise ImportError(
+        "FAISS is not installed. Please install it with: pip install faiss-cpu "
+        "or pip install faiss-gpu"
+    )
 from typing import Tuple, Optional
 from .utils import check_faiss_gpu, print_progress
+
+# Verify FAISS has basic functionality
+if not hasattr(faiss, 'Index') and not any('Index' in attr for attr in dir(faiss) if not attr.startswith('_')):
+    raise RuntimeError(
+        "FAISS installation appears incomplete. No Index classes found. "
+        "Please reinstall FAISS: pip install --upgrade faiss-cpu"
+    )
+
+
+def _get_available_faiss_classes():
+    """Get list of available FAISS index classes for debugging."""
+    return [attr for attr in dir(faiss) if 'Index' in attr and not attr.startswith('_')]
+
+
+def _create_quantizer(dimension: int, verbose: bool = True) -> object:
+    """
+    Create a FAISS quantizer, trying multiple methods.
+    
+    Args:
+        dimension: Embedding dimension
+        verbose: Whether to print debug messages
+        
+    Returns:
+        FAISS quantizer object
+        
+    Raises:
+        RuntimeError: If no quantizer can be created
+    """
+    quantizer = None
+    
+    # Try IndexFlatIP first (preferred for cosine similarity)
+    if hasattr(faiss, 'IndexFlatIP'):
+        try:
+            quantizer = faiss.IndexFlatIP(dimension)
+            if verbose:
+                print_progress("Using IndexFlatIP quantizer", verbose)
+            return quantizer
+        except Exception as e:
+            if verbose:
+                print_progress(f"IndexFlatIP failed: {e}", verbose)
+    
+    # Try IndexFlat with METRIC_INNER_PRODUCT
+    if quantizer is None and hasattr(faiss, 'IndexFlat'):
+        try:
+            if hasattr(faiss, 'METRIC_INNER_PRODUCT'):
+                quantizer = faiss.IndexFlat(dimension, faiss.METRIC_INNER_PRODUCT)
+            else:
+                quantizer = faiss.IndexFlat(dimension)
+            if verbose:
+                print_progress("Using IndexFlat quantizer", verbose)
+            return quantizer
+        except Exception as e:
+            if verbose:
+                print_progress(f"IndexFlat failed: {e}", verbose)
+    
+    # Try IndexFlatL2 as last resort
+    if quantizer is None and hasattr(faiss, 'IndexFlatL2'):
+        try:
+            quantizer = faiss.IndexFlatL2(dimension)
+            if verbose:
+                print_progress("Using IndexFlatL2 quantizer (L2 distance)", verbose)
+            return quantizer
+        except Exception as e:
+            if verbose:
+                print_progress(f"IndexFlatL2 failed: {e}", verbose)
+    
+    # Try using index_factory as alternative method
+    if quantizer is None and hasattr(faiss, 'index_factory'):
+        try:
+            # Try inner product first
+            quantizer = faiss.index_factory(dimension, "Flat", faiss.METRIC_INNER_PRODUCT)
+            if verbose:
+                print_progress("Using index_factory with METRIC_INNER_PRODUCT", verbose)
+            return quantizer
+        except Exception:
+            try:
+                # Fallback to L2
+                quantizer = faiss.index_factory(dimension, "Flat")
+                if verbose:
+                    print_progress("Using index_factory with L2 metric", verbose)
+                return quantizer
+            except Exception as e:
+                if verbose:
+                    print_progress(f"index_factory failed: {e}", verbose)
+    
+    # If all failed, raise error with available classes
+    available = _get_available_faiss_classes()
+    raise RuntimeError(
+        f"Unable to create FAISS quantizer. Available FAISS index classes: {', '.join(available[:20])}\n"
+        f"Please check your FAISS installation: pip install --upgrade faiss-cpu"
+    )
 
 
 class FAISSIndex:
@@ -67,15 +164,7 @@ class FAISSIndex:
         # Build index based on type
         if index_type_actual == "flat":
             # Flat index with inner product (cosine similarity on normalized vectors)
-            try:
-                if hasattr(faiss, 'IndexFlatIP'):
-                    self.index = faiss.IndexFlatIP(self.dimension)
-                else:
-                    # Fallback: use IndexFlat with inner product metric
-                    self.index = faiss.IndexFlat(self.dimension, faiss.METRIC_INNER_PRODUCT)
-            except (AttributeError, TypeError):
-                # Final fallback: regular IndexFlat (will use L2, but works with normalized vectors)
-                self.index = faiss.IndexFlat(self.dimension)
+            self.index = _create_quantizer(self.dimension, self.verbose)
         elif index_type_actual == "hnsw":
             # HNSW index for approximate nearest neighbor search
             # M=32 is a good default for balance between accuracy and speed
@@ -92,14 +181,8 @@ class FAISSIndex:
         elif index_type_actual == "ivf":
             # IVF index for very large datasets
             nlist = min(4096, int(np.sqrt(self.n_samples)))  # Number of clusters
-            # Create quantizer - try IndexFlatIP first, fallback if needed
-            try:
-                if hasattr(faiss, 'IndexFlatIP'):
-                    quantizer = faiss.IndexFlatIP(self.dimension)
-                else:
-                    quantizer = faiss.IndexFlat(self.dimension, faiss.METRIC_INNER_PRODUCT)
-            except (AttributeError, TypeError):
-                quantizer = faiss.IndexFlat(self.dimension)
+            # Create quantizer using helper function
+            quantizer = _create_quantizer(self.dimension, self.verbose)
             self.index = faiss.IndexIVFFlat(quantizer, self.dimension, nlist)
             # Increase nprobe for very large datasets to improve recall
             # For 1M+ records, search more clusters to find similar companies
@@ -181,22 +264,8 @@ class FAISSIndex:
         
         print_progress(f"Building IVFPQ index: nlist={nlist}, m={m}, nbits={nbits}", self.verbose)
         
-        # Create quantizer - handle different FAISS versions
-        quantizer = None
-        if hasattr(faiss, 'IndexFlatIP'):
-            # Preferred: IndexFlatIP for inner product (cosine similarity)
-            quantizer = faiss.IndexFlatIP(self.dimension)
-        elif hasattr(faiss, 'METRIC_INNER_PRODUCT'):
-            # Fallback: IndexFlat with inner product metric
-            try:
-                quantizer = faiss.IndexFlat(self.dimension, faiss.METRIC_INNER_PRODUCT)
-            except (TypeError, ValueError):
-                # If that doesn't work, use regular IndexFlat
-                quantizer = faiss.IndexFlat(self.dimension)
-        else:
-            # Final fallback: regular IndexFlat (L2 distance)
-            # Note: For normalized vectors, L2 distance is related to cosine similarity
-            quantizer = faiss.IndexFlat(self.dimension)
+        # Create quantizer using helper function
+        quantizer = _create_quantizer(self.dimension, self.verbose)
         
         # Create IVFPQ index
         if not hasattr(faiss, 'IndexIVFPQ'):
