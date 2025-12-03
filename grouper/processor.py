@@ -181,7 +181,6 @@ class CompanyGrouper:
         
         # Free memory: delete large objects
         print_progress("Freeing memory...", self.verbose)
-        del embedding_gen
         del faiss_index
         del embeddings
         gc.collect()
@@ -597,12 +596,12 @@ class CompanyGrouper:
             np.save(cache_path, reduced_embeddings)
             
             cache_meta = {
-                'original_dim': original_dim,
-                'reduced_dim': actual_dim,
-                'n_samples': n_samples,
+                'original_dim': int(original_dim),
+                'reduced_dim': int(actual_dim),
+                'n_samples': int(n_samples),
                 'variance_explained': float(variance_explained),
-                'preserve_variance': self.preserve_variance,
-                'created': time.time()
+                'preserve_variance': float(self.preserve_variance),
+                'created': float(time.time())
             }
             try:
                 with open(cache_meta_path, 'w') as f:
