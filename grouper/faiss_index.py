@@ -67,7 +67,15 @@ class FAISSIndex:
         # Build index based on type
         if index_type_actual == "flat":
             # Flat index with inner product (cosine similarity on normalized vectors)
-            self.index = faiss.IndexFlatIP(self.dimension)
+            try:
+                if hasattr(faiss, 'IndexFlatIP'):
+                    self.index = faiss.IndexFlatIP(self.dimension)
+                else:
+                    # Fallback: use IndexFlat with inner product metric
+                    self.index = faiss.IndexFlat(self.dimension, faiss.METRIC_INNER_PRODUCT)
+            except (AttributeError, TypeError):
+                # Final fallback: regular IndexFlat (will use L2, but works with normalized vectors)
+                self.index = faiss.IndexFlat(self.dimension)
         elif index_type_actual == "hnsw":
             # HNSW index for approximate nearest neighbor search
             # M=32 is a good default for balance between accuracy and speed
@@ -84,7 +92,14 @@ class FAISSIndex:
         elif index_type_actual == "ivf":
             # IVF index for very large datasets
             nlist = min(4096, int(np.sqrt(self.n_samples)))  # Number of clusters
-            quantizer = faiss.IndexFlatIP(self.dimension)
+            # Create quantizer - try IndexFlatIP first, fallback if needed
+            try:
+                if hasattr(faiss, 'IndexFlatIP'):
+                    quantizer = faiss.IndexFlatIP(self.dimension)
+                else:
+                    quantizer = faiss.IndexFlat(self.dimension, faiss.METRIC_INNER_PRODUCT)
+            except (AttributeError, TypeError):
+                quantizer = faiss.IndexFlat(self.dimension)
             self.index = faiss.IndexIVFFlat(quantizer, self.dimension, nlist)
             # Increase nprobe for very large datasets to improve recall
             # For 1M+ records, search more clusters to find similar companies
@@ -99,6 +114,11 @@ class FAISSIndex:
             print_progress(f"IVF nprobe set to {self.index.nprobe} (searches {self.index.nprobe}/{nlist} clusters)", self.verbose)
         elif index_type_actual == "ivfpq":
             # IVFPQ index with Product Quantization for extremely large datasets
+            if not hasattr(faiss, 'IndexIVFPQ'):
+                raise ValueError(
+                    "IndexIVFPQ is not available in this FAISS version. "
+                    "Please use 'ivf' or 'hnsw' index type instead, or upgrade FAISS."
+                )
             self.index = self._build_pq_index()
         else:
             raise ValueError(f"Unknown index type: {index_type_actual}")
@@ -161,10 +181,29 @@ class FAISSIndex:
         
         print_progress(f"Building IVFPQ index: nlist={nlist}, m={m}, nbits={nbits}", self.verbose)
         
-        # Create quantizer
-        quantizer = faiss.IndexFlatIP(self.dimension)
+        # Create quantizer - handle different FAISS versions
+        quantizer = None
+        if hasattr(faiss, 'IndexFlatIP'):
+            # Preferred: IndexFlatIP for inner product (cosine similarity)
+            quantizer = faiss.IndexFlatIP(self.dimension)
+        elif hasattr(faiss, 'METRIC_INNER_PRODUCT'):
+            # Fallback: IndexFlat with inner product metric
+            try:
+                quantizer = faiss.IndexFlat(self.dimension, faiss.METRIC_INNER_PRODUCT)
+            except (TypeError, ValueError):
+                # If that doesn't work, use regular IndexFlat
+                quantizer = faiss.IndexFlat(self.dimension)
+        else:
+            # Final fallback: regular IndexFlat (L2 distance)
+            # Note: For normalized vectors, L2 distance is related to cosine similarity
+            quantizer = faiss.IndexFlat(self.dimension)
         
         # Create IVFPQ index
+        if not hasattr(faiss, 'IndexIVFPQ'):
+            raise ValueError(
+                "IndexIVFPQ is not available in this FAISS version. "
+                "Please use 'ivf' or 'hnsw' index type instead, or upgrade FAISS."
+            )
         index = faiss.IndexIVFPQ(quantizer, self.dimension, nlist, m, nbits)
         
         # Set nprobe dynamically based on dataset size
