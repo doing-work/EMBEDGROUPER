@@ -412,6 +412,116 @@ def _cluster_with_unionfind(n_samples: int, edges_list: List[Tuple[int, int]], v
     return _build_cluster_assignments_from_unionfind(uf, n_samples, verbose)
 
 
+def cluster_with_hdbscan(
+    embeddings: np.ndarray,
+    min_cluster_size: int = 15,
+    min_samples: Optional[int] = None,
+    metric: str = "cosine",
+    verbose: bool = True
+) -> Dict[int, int]:
+    """
+    Cluster embeddings using HDBSCAN algorithm.
+    
+    Args:
+        embeddings: Normalized embedding vectors (n_samples, embedding_dim)
+        min_cluster_size: Minimum size of clusters
+        min_samples: Minimum samples in neighborhood (auto if None)
+        metric: Distance metric ('cosine', 'euclidean', etc.)
+        verbose: Whether to print progress
+        
+    Returns:
+        Dict mapping index -> cluster_id (-1 for noise points)
+    """
+    try:
+        import hdbscan
+    except ImportError:
+        raise ImportError("hdbscan is required for HDBSCAN clustering. Install with: pip install hdbscan")
+    
+    print_progress(f"Clustering with HDBSCAN (min_cluster_size={min_cluster_size})...", verbose)
+    
+    # Auto-set min_samples if not provided (typically same as min_cluster_size)
+    if min_samples is None:
+        min_samples = min_cluster_size
+    
+    # Create HDBSCAN clusterer
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        metric=metric,
+        core_dist_n_jobs=-1  # Use all available cores
+    )
+    
+    # Fit the clusterer
+    cluster_labels = clusterer.fit_predict(embeddings)
+    
+    # Convert to dictionary format
+    cluster_assignments = {i: int(label) for i, label in enumerate(cluster_labels)}
+    
+    # Count clusters (excluding noise points labeled as -1)
+    unique_clusters = set(cluster_labels)
+    num_clusters = len([c for c in unique_clusters if c >= 0])
+    num_noise = sum(1 for c in cluster_labels if c == -1)
+    
+    print_progress(f"HDBSCAN found {num_clusters} clusters ({num_noise} noise points)", verbose)
+    
+    return cluster_assignments
+
+
+def cluster_with_agglomerative(
+    embeddings: np.ndarray,
+    threshold: float = 0.85,
+    n_clusters: Optional[int] = None,
+    linkage: str = "average",
+    metric: str = "cosine",
+    verbose: bool = True
+) -> Dict[int, int]:
+    """
+    Cluster embeddings using Agglomerative Clustering.
+    
+    Args:
+        embeddings: Normalized embedding vectors (n_samples, embedding_dim)
+        threshold: Distance threshold for clustering (when n_clusters is None)
+        n_clusters: Number of clusters (if None, uses distance_threshold)
+        linkage: Linkage criterion ('ward', 'complete', 'average', 'single')
+        metric: Distance metric ('cosine', 'euclidean', etc.)
+        verbose: Whether to print progress
+        
+    Returns:
+        Dict mapping index -> cluster_id
+    """
+    try:
+        from sklearn.cluster import AgglomerativeClustering
+    except ImportError:
+        raise ImportError("scikit-learn is required for Agglomerative clustering. Install with: pip install scikit-learn")
+    
+    print_progress(f"Clustering with Agglomerative Clustering (threshold={threshold}, linkage={linkage})...", verbose)
+    
+    # Convert cosine similarity threshold to distance
+    # For cosine similarity: distance = 1 - similarity
+    # For normalized vectors, cosine distance = 1 - cosine similarity
+    distance_threshold = 1.0 - threshold if metric == "cosine" else threshold
+    
+    # Create clusterer
+    clusterer = AgglomerativeClustering(
+        n_clusters=n_clusters,
+        distance_threshold=distance_threshold if n_clusters is None else None,
+        linkage=linkage,
+        metric=metric,
+        compute_full_tree=True if n_clusters is None else 'auto'
+    )
+    
+    # Fit the clusterer
+    cluster_labels = clusterer.fit_predict(embeddings)
+    
+    # Convert to dictionary format
+    cluster_assignments = {i: int(label) for i, label in enumerate(cluster_labels)}
+    
+    num_clusters = len(set(cluster_labels))
+    print_progress(f"Agglomerative Clustering found {num_clusters} clusters", verbose)
+    
+    return cluster_assignments
+
+
 def cluster_companies(
     n_samples: int,
     faiss_index,
@@ -431,15 +541,15 @@ def cluster_companies(
     
     Args:
         n_samples: Total number of companies
-        faiss_index: FAISSIndex instance
+        faiss_index: FAISSIndex instance (not used for hdbscan/agglomerative)
         embeddings: All embeddings (n_samples, embedding_dim)
         original_names: List of original company names
         normalized_names: List of normalized company names
         threshold: Similarity threshold for clustering
-        top_k: Number of neighbors to retrieve per company
-        clustering_method: Clustering algorithm ('connected_components')
+        top_k: Number of neighbors to retrieve per company (not used for hdbscan/agglomerative)
+        clustering_method: Clustering algorithm ('connected_components', 'hdbscan', 'agglomerative')
         canonical_method: Method to select canonical name
-        max_cluster_size: Maximum cluster size before splitting (default: 1000)
+        max_cluster_size: Maximum cluster size before splitting (default: 1000, not used for hdbscan/agglomerative)
         verbose: Whether to print progress
         
     Returns:
@@ -450,8 +560,217 @@ def cluster_companies(
         - neighbor_counts: Dict mapping index -> number of neighbors found
         - cluster_sizes: Dict mapping cluster_id -> cluster size
     """
-    print_progress(f"Finding similar pairs (threshold={threshold})...", verbose)
+    # Route to appropriate clustering method
+    if clustering_method == "hdbscan":
+        # HDBSCAN clustering - works directly on embeddings
+        print_progress("Using HDBSCAN clustering method...", verbose)
+        # Auto-determine min_cluster_size based on dataset size
+        min_cluster_size = max(5, min(50, n_samples // 10000))
+        cluster_assignments = cluster_with_hdbscan(
+            embeddings=embeddings,
+            min_cluster_size=min_cluster_size,
+            verbose=verbose
+        )
+        # Set dummy neighbor counts (not applicable for HDBSCAN)
+        neighbor_counts = {i: 0 for i in range(n_samples)}
+    elif clustering_method == "agglomerative":
+        # Agglomerative clustering - works directly on embeddings
+        print_progress("Using Agglomerative Clustering method...", verbose)
+        cluster_assignments = cluster_with_agglomerative(
+            embeddings=embeddings,
+            threshold=threshold,
+            verbose=verbose
+        )
+        # Set dummy neighbor counts (not applicable for Agglomerative)
+        neighbor_counts = {i: 0 for i in range(n_samples)}
+    elif clustering_method == "connected_components":
+        # Original connected components method using FAISS
+        print_progress(f"Finding similar pairs (threshold={threshold})...", verbose)
+        cluster_assignments, neighbor_counts = _cluster_with_connected_components(
+            n_samples=n_samples,
+            faiss_index=faiss_index,
+            embeddings=embeddings,
+            threshold=threshold,
+            top_k=top_k,
+            search_batch_size=search_batch_size,
+            max_cluster_size=max_cluster_size,
+            verbose=verbose
+        )
+    else:
+        raise ValueError(f"Unknown clustering method: {clustering_method}. Choose from: 'connected_components', 'hdbscan', 'agglomerative'")
     
+    # Handle noise points from HDBSCAN (label -1) - assign them unique cluster IDs
+    if clustering_method == "hdbscan":
+        max_cluster_id = max(cluster_assignments.values()) if cluster_assignments else -1
+        next_noise_id = max_cluster_id + 1
+        for idx, cluster_id in list(cluster_assignments.items()):
+            if cluster_id == -1:
+                cluster_assignments[idx] = next_noise_id
+                next_noise_id += 1
+    
+    # Common post-processing: select canonical names and compute similarity scores
+    return _post_process_clusters(
+        cluster_assignments=cluster_assignments,
+        embeddings=embeddings,
+        original_names=original_names,
+        normalized_names=normalized_names,
+        canonical_method=canonical_method,
+        neighbor_counts=neighbor_counts,
+        verbose=verbose
+    )
+
+
+def _post_process_clusters(
+    cluster_assignments: Dict[int, int],
+    embeddings: np.ndarray,
+    original_names: List[str],
+    normalized_names: List[str],
+    canonical_method: str,
+    neighbor_counts: Dict[int, int],
+    verbose: bool
+) -> Tuple[Dict[int, int], Dict[int, str], Dict[int, float], Dict[int, int], Dict[int, int]]:
+    """
+    Post-process clusters: select canonical names and compute similarity scores.
+    
+    Returns:
+        Tuple of (cluster_assignments, canonical_names, similarity_scores, neighbor_counts, cluster_sizes)
+    """
+    # Group indices by cluster
+    clusters_dict: Dict[int, List[int]] = {}
+    for idx, cluster_id in cluster_assignments.items():
+        if cluster_id not in clusters_dict:
+            clusters_dict[cluster_id] = []
+        clusters_dict[cluster_id].append(idx)
+    
+    # Select canonical names for each cluster
+    print_progress("Selecting canonical names...", verbose)
+    canonical_names = {}
+    similarity_scores = {}
+    cluster_sizes = {}
+    
+    # Add progress tracking for large numbers of clusters
+    cluster_items = clusters_dict.items()
+    if verbose and len(clusters_dict) > 1000:
+        cluster_items = tqdm(cluster_items, desc="Selecting canonicals", unit="cluster")
+    
+    for cluster_id, cluster_indices in cluster_items:
+        cluster_size = len(cluster_indices)
+        cluster_sizes[cluster_id] = cluster_size
+        
+        # Fast path for single-member clusters
+        if cluster_size == 1:
+            idx = cluster_indices[0]
+            canonical_names[cluster_id] = original_names[idx]
+            similarity_scores[idx] = 1.0
+            continue
+        
+        # Multi-member clusters
+        canonical_name, canonical_idx, avg_sim = select_canonical_name(
+            cluster_indices,
+            original_names,
+            normalized_names,
+            embeddings,
+            method=canonical_method
+        )
+        canonical_names[cluster_id] = canonical_name
+        
+        # Compute similarity to canonical for each member - BATCHED for performance
+        canonical_embedding = embeddings[canonical_idx]
+        cluster_embeddings = embeddings[cluster_indices]
+        # Compute all similarities in one vectorized operation
+        similarities = np.dot(cluster_embeddings, canonical_embedding)
+        # Store all similarities at once
+        for idx, similarity in zip(cluster_indices, similarities):
+            similarity_scores[idx] = float(similarity)
+    
+    print_progress(f"Created {len(clusters_dict)} clusters", verbose)
+    
+    # Validate clustering quality and provide feedback
+    _validate_clustering_quality(clusters_dict, similarity_scores, neighbor_counts, verbose)
+    
+    return cluster_assignments, canonical_names, similarity_scores, neighbor_counts, cluster_sizes
+
+
+def _validate_clustering_quality(
+    clusters_dict: Dict[int, List[int]],
+    similarity_scores: Dict[int, float],
+    neighbor_counts: Dict[int, int],
+    verbose: bool
+):
+    """
+    Validate clustering quality and provide actionable feedback.
+    
+    Args:
+        clusters_dict: Dictionary mapping cluster_id -> list of indices
+        similarity_scores: Dictionary mapping index -> similarity to canonical
+        neighbor_counts: Dictionary mapping index -> number of neighbors found
+        verbose: Whether to print feedback
+    """
+    if not verbose or not clusters_dict:
+        return
+    
+    # Calculate quality metrics
+    cluster_sizes = [len(indices) for indices in clusters_dict.values()]
+    avg_cluster_size = np.mean(cluster_sizes) if cluster_sizes else 0
+    max_cluster_size = max(cluster_sizes) if cluster_sizes else 0
+    num_singletons = sum(1 for size in cluster_sizes if size == 1)
+    pct_singletons = (num_singletons / len(clusters_dict)) * 100 if clusters_dict else 0
+    
+    # Calculate average similarity scores
+    avg_similarities = [np.mean([similarity_scores.get(idx, 0.0) for idx in indices]) 
+                       for indices in clusters_dict.values() if len(indices) > 1]
+    overall_avg_similarity = np.mean(avg_similarities) if avg_similarities else 0.0
+    
+    # Calculate average neighbor counts
+    avg_neighbors = np.mean(list(neighbor_counts.values())) if neighbor_counts else 0
+    
+    # Provide quality feedback
+    print_progress("\n" + "="*60, verbose)
+    print_progress("CLUSTERING QUALITY METRICS", verbose)
+    print_progress("="*60, verbose)
+    print_progress(f"Total clusters: {len(clusters_dict):,}", verbose)
+    print_progress(f"Average cluster size: {avg_cluster_size:.2f}", verbose)
+    print_progress(f"Largest cluster size: {max_cluster_size:,}", verbose)
+    print_progress(f"Singleton clusters: {num_singletons:,} ({pct_singletons:.1f}%)", verbose)
+    print_progress(f"Average similarity to canonical: {overall_avg_similarity:.3f}", verbose)
+    print_progress(f"Average neighbors found: {avg_neighbors:.1f}", verbose)
+    
+    # Quality warnings and recommendations
+    if pct_singletons > 80:
+        print_progress(f"\nWARNING: {pct_singletons:.1f}% of clusters are singletons.", verbose)
+        print_progress("  -> RECOMMENDATION: Lower threshold to find more matches", verbose)
+    
+    if max_cluster_size > 10000:
+        print_progress(f"\nWARNING: Very large cluster detected ({max_cluster_size:,} members).", verbose)
+        print_progress("  -> RECOMMENDATION: Increase threshold to split large clusters", verbose)
+    
+    if overall_avg_similarity < 0.80 and avg_similarities:
+        print_progress(f"\nWARNING: Low average similarity ({overall_avg_similarity:.3f}).", verbose)
+        print_progress("  -> RECOMMENDATION: Increase threshold for tighter clusters", verbose)
+    
+    if avg_neighbors < 1.0:
+        print_progress(f"\nWARNING: Low average neighbors ({avg_neighbors:.1f}).", verbose)
+        print_progress("  -> RECOMMENDATION: Lower threshold or increase top_k", verbose)
+    
+    print_progress("="*60 + "\n", verbose)
+
+
+def _cluster_with_connected_components(
+    n_samples: int,
+    faiss_index,
+    embeddings: np.ndarray,
+    threshold: float,
+    top_k: int,
+    search_batch_size: int,
+    max_cluster_size: int,
+    verbose: bool
+) -> Tuple[Dict[int, int], Dict[int, int]]:
+    """
+    Cluster using connected components method (original implementation).
+    
+    Returns:
+        Tuple of (cluster_assignments, neighbor_counts)
+    """
     # Find all similar pairs - batch processing for efficiency
     # Use streaming Union-Find to avoid RAM issues (no edge list storage)
     neighbor_counts: Dict[int, int] = {}
@@ -524,20 +843,33 @@ def cluster_companies(
                     edge_count += 1
                     edges_added_this_batch += 1
             
-            # Debug: log if we're adding too many edges
-            if verbose and edges_added_this_batch > 100:
-                print_progress(f"Warning: Added {edges_added_this_batch} edges for company {global_idx} (may indicate low threshold)", verbose)
+            # Enhanced warning for excessive edges per company
+            if verbose and edges_added_this_batch > 200:
+                print_progress(f"WARNING: Added {edges_added_this_batch} edges for company {global_idx}", verbose)
+                print_progress(f"  -> This indicates threshold ({threshold:.2f}) may be too low", verbose)
+                print_progress(f"  -> RECOMMENDATION: Increase threshold to {min(0.95, threshold + 0.05):.2f}", verbose)
+            elif verbose and edges_added_this_batch > 100:
+                print_progress(f"Warning: Added {edges_added_this_batch} edges for company {global_idx} (consider increasing threshold)", verbose)
     
     print_progress(f"Processed {edge_count:,} edges above threshold {threshold}, building clusters...", verbose)
     
-    # Debug: Check if we have too many edges (which would cause giant clusters)
+    # Enhanced error handling and warnings
     avg_edges_per_node = edge_count / n_samples if n_samples > 0 else 0
-    if avg_edges_per_node > 5:
+    
+    if avg_edges_per_node > 10:
+        print_progress(f"WARNING: Very high average edges per node ({avg_edges_per_node:.2f}).", verbose)
+        print_progress(f"  -> RECOMMENDATION: Increase threshold from {threshold:.2f} to {min(0.95, threshold + 0.10):.2f}", verbose)
+        print_progress(f"  -> OR reduce top_k from {top_k} to {max(10, top_k // 2)}", verbose)
+        print_progress(f"  -> This will reduce cluster sizes and improve quality.", verbose)
+    elif avg_edges_per_node > 5:
         print_progress(f"Warning: High average edges per node ({avg_edges_per_node:.2f}). This may cause large clusters.", verbose)
-        print_progress(f"Consider increasing threshold (current: {threshold}) or reducing top_k (current: {top_k})", verbose)
+        print_progress(f"  -> Consider increasing threshold from {threshold:.2f} to {min(0.95, threshold + 0.05):.2f}", verbose)
+        print_progress(f"  -> OR reducing top_k from {top_k} to {max(20, int(top_k * 0.75))}", verbose)
     
     if edge_count == 0:
-        print_progress("Warning: No edges found above threshold. All companies will be in separate clusters.", verbose)
+        print_progress("WARNING: No edges found above threshold. All companies will be in separate clusters.", verbose)
+        print_progress(f"  -> RECOMMENDATION: Lower threshold from {threshold:.2f} to {max(0.70, threshold - 0.10):.2f}", verbose)
+        print_progress(f"  -> OR increase top_k from {top_k} to {top_k * 2}", verbose)
     
     # Build cluster assignments from Union-Find structure
     cluster_assignments = _build_cluster_assignments_from_unionfind(uf, n_samples, verbose)
@@ -637,48 +969,5 @@ def cluster_companies(
             
             print_progress(f"After size-based splitting: {len(clusters_dict)} clusters", verbose)
     
-    # Select canonical names for each cluster
-    print_progress("Selecting canonical names...", verbose)
-    canonical_names = {}
-    similarity_scores = {}
-    cluster_sizes = {}
-    
-    # Add progress tracking for large numbers of clusters
-    cluster_items = clusters_dict.items()
-    if verbose and len(clusters_dict) > 1000:
-        cluster_items = tqdm(cluster_items, desc="Selecting canonicals", unit="cluster")
-    
-    for cluster_id, cluster_indices in cluster_items:
-        cluster_size = len(cluster_indices)
-        cluster_sizes[cluster_id] = cluster_size
-        
-        # Fast path for single-member clusters
-        if cluster_size == 1:
-            idx = cluster_indices[0]
-            canonical_names[cluster_id] = original_names[idx]
-            similarity_scores[idx] = 1.0
-            continue
-        
-        # Multi-member clusters
-        canonical_name, canonical_idx, avg_sim = select_canonical_name(
-            cluster_indices,
-            original_names,
-            normalized_names,
-            embeddings,
-            method=canonical_method
-        )
-        canonical_names[cluster_id] = canonical_name
-        
-        # Compute similarity to canonical for each member - BATCHED for performance
-        canonical_embedding = embeddings[canonical_idx]
-        cluster_embeddings = embeddings[cluster_indices]
-        # Compute all similarities in one vectorized operation
-        similarities = np.dot(cluster_embeddings, canonical_embedding)
-        # Store all similarities at once
-        for idx, similarity in zip(cluster_indices, similarities):
-            similarity_scores[idx] = float(similarity)
-    
-    print_progress(f"Created {len(clusters_dict)} clusters", verbose)
-    
-    return cluster_assignments, canonical_names, similarity_scores, neighbor_counts, cluster_sizes
+    return cluster_assignments, neighbor_counts
 

@@ -87,16 +87,22 @@ Examples:
         '--index-type',
         type=str,
         default='auto',
-        choices=['auto', 'flat', 'hnsw', 'ivf'],
-        help='FAISS index type (default: auto)'
+        choices=['auto', 'flat', 'hnsw', 'ivf', 'ivfpq'],
+        help='FAISS index type (default: auto). ivfpq uses Product Quantization for memory efficiency on very large datasets'
     )
     
     parser.add_argument(
         '--clustering',
         type=str,
         default='connected_components',
-        choices=['connected_components'],
-        help='Clustering method (default: connected_components)'
+        choices=['connected_components', 'hdbscan', 'agglomerative'],
+        help='Clustering method (default: connected_components). hdbscan and agglomerative work directly on embeddings without FAISS search'
+    )
+    
+    parser.add_argument(
+        '--use-memmap',
+        action='store_true',
+        help='Use memory-mapped files for embeddings (recommended for large datasets to reduce RAM usage)'
     )
     
     parser.add_argument(
@@ -137,6 +143,7 @@ Examples:
         clustering_method=args.clustering,
         canonical_method=args.canonical_method,
         max_cluster_size=args.max_cluster_size,
+        use_memmap=args.use_memmap,
         verbose=not args.quiet
     )
     

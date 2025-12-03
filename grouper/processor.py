@@ -11,7 +11,7 @@ from .normalizer import normalize_company_names
 from .embeddings import EmbeddingGenerator
 from .faiss_index import FAISSIndex
 from .clustering import cluster_companies
-from .utils import print_progress, format_time, check_faiss_gpu
+from .utils import print_progress, format_time, check_faiss_gpu, calculate_adaptive_topk, optimize_threshold
 
 
 class CompanyGrouper:
@@ -34,13 +34,14 @@ class CompanyGrouper:
         
         Args:
             model_name: Embedding model name
-            batch_size: Batch size for embeddings
+            batch_size: Batch size for embeddings (0 for auto-tuning)
             threshold: Similarity threshold for clustering
             top_k: Number of neighbors to retrieve
-            index_type: FAISS index type
-            clustering_method: Clustering algorithm
+            index_type: FAISS index type ('auto', 'flat', 'hnsw', 'ivf', 'ivfpq')
+            clustering_method: Clustering algorithm ('connected_components', 'hdbscan', 'agglomerative')
             canonical_method: Method to select canonical names
             max_cluster_size: Maximum cluster size before splitting (default: 1000)
+            use_memmap: Whether to use memory-mapped files for embeddings
             verbose: Whether to print progress
         """
         self.model_name = model_name
@@ -51,6 +52,7 @@ class CompanyGrouper:
         self.clustering_method = clustering_method
         self.canonical_method = canonical_method
         self.max_cluster_size = max_cluster_size
+        self.use_memmap = use_memmap
         self.verbose = verbose
         
         self.timing_stats = {}
@@ -99,12 +101,22 @@ class CompanyGrouper:
         # Step 3: Generate embeddings
         print_progress("Generating embeddings...", self.verbose)
         embed_start = time.time()
+        
+        # Determine memmap path if using memory-mapped files
+        memmap_path = None
+        if self.use_memmap:
+            checkpoint_dir = output_file.replace('.csv', '_checkpoints')
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            memmap_path = os.path.join(checkpoint_dir, 'embeddings_memmap.npy')
+        
         embedding_gen = EmbeddingGenerator(
             model_name=self.model_name,
             batch_size=self.batch_size,
+            use_memmap=self.use_memmap,
+            memmap_path=memmap_path,
             verbose=self.verbose
         )
-        embeddings = embedding_gen.generate_embeddings(normalized_names)
+        embeddings = embedding_gen.generate_embeddings(normalized_names, memmap_path=memmap_path if self.use_memmap else None)
         self.timing_stats['embeddings'] = time.time() - embed_start
         
         # Step 4: Build FAISS index
@@ -126,14 +138,29 @@ class CompanyGrouper:
         index_path = os.path.join(checkpoint_dir, 'faiss_index.bin')
         
         print_progress("Saving checkpoints to disk to free RAM...", self.verbose)
-        print_progress(f"Saving embeddings ({embeddings.nbytes / 1024**3:.2f} GB) to {embeddings_path}...", self.verbose)
-        np.save(embeddings_path, embeddings)
+        embedding_dim = embeddings.shape[1]
+        
+        # Use memory-mapped file for embeddings (more memory efficient)
+        print_progress(f"Saving embeddings ({embeddings.nbytes / 1024**3:.2f} GB) as memory-mapped file: {embeddings_path}...", self.verbose)
+        # Remove existing file if it exists
+        if os.path.exists(embeddings_path):
+            os.remove(embeddings_path)
+        
+        # Create memory-mapped file and copy data
+        memmap_embeddings = np.memmap(
+            embeddings_path,
+            dtype='float32',
+            mode='w+',
+            shape=(n_samples, embedding_dim)
+        )
+        memmap_embeddings[:] = embeddings[:]
+        memmap_embeddings.flush()
+        del memmap_embeddings  # Close the memory-mapped file
         
         print_progress(f"Saving FAISS index to {index_path}...", self.verbose)
         faiss_index.save_to_disk(index_path)
         
         # Store metadata for reloading
-        embedding_dim = embeddings.shape[1]
         index_type_used = faiss_index.index_type
         use_gpu = faiss_index.use_gpu
         
@@ -155,10 +182,14 @@ class CompanyGrouper:
         print_progress("Memory freed. Loading from disk for clustering...", self.verbose)
         
         # Step 5: Load from disk and cluster
-        print_progress("Loading embeddings and index from disk...", self.verbose)
-        # Load embeddings - use memory mapping for large files to save RAM
-        # We'll load in chunks during clustering if needed
-        embeddings = np.load(embeddings_path)
+        print_progress("Loading embeddings and index from disk (using memory mapping)...", self.verbose)
+        # Load embeddings as memory-mapped file (doesn't load into RAM)
+        embeddings = np.memmap(
+            embeddings_path,
+            dtype='float32',
+            mode='r',
+            shape=(n_samples, embedding_dim)
+        )
         faiss_index = FAISSIndex.load_from_disk(
             index_path,
             dimension=embedding_dim,
@@ -173,23 +204,14 @@ class CompanyGrouper:
         # Use larger batch size for search on very large datasets
         search_batch_size = min(5000, max(1000, n_samples // 500)) if n_samples > 100000 else 1000
         
-        # For very large datasets, increase top_k to find more neighbors
-        # This helps ensure similar companies aren't missed due to ranking
-        effective_top_k = self.top_k
-        if n_samples > 1000000:
-            # For 1M+ records, significantly increase top_k for better coverage
-            effective_top_k = max(200, self.top_k * 2)
-            if self.verbose:
-                print_progress(f"Increased top_k from {self.top_k} to {effective_top_k} for very large dataset (1M+ records)", self.verbose)
-        elif n_samples > 500000:
-            # For 500K-1M records, moderately increase top_k
-            effective_top_k = max(150, int(self.top_k * 1.5))
-            if self.verbose:
-                print_progress(f"Increased top_k from {self.top_k} to {effective_top_k} for large dataset (500K-1M records)", self.verbose)
-        elif n_samples > 100000 and self.top_k < 100:
-            effective_top_k = max(100, self.top_k)
-            if self.verbose:
-                print_progress(f"Increased top_k from {self.top_k} to {effective_top_k} for medium dataset", self.verbose)
+        # Calculate adaptive top_k based on dataset characteristics
+        effective_top_k = calculate_adaptive_topk(
+            n_samples=n_samples,
+            base_topk=self.top_k,
+            threshold=self.threshold
+        )
+        if effective_top_k != self.top_k and self.verbose:
+            print_progress(f"Adaptive top_k: {self.top_k} -> {effective_top_k} (dataset size: {n_samples:,})", self.verbose)
         
         cluster_assignments, canonical_names, similarity_scores, neighbor_counts, cluster_sizes = cluster_companies(
             n_samples=n_samples,
