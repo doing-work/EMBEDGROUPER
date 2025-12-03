@@ -3,9 +3,11 @@
 import time
 import os
 import gc
+import json
+import hashlib
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 from .normalizer import normalize_company_names
 from .embeddings import EmbeddingGenerator
@@ -28,6 +30,8 @@ class CompanyGrouper:
         canonical_method: str = "longest",
         max_cluster_size: int = 1000,
         use_memmap: bool = False,
+        cache_embeddings: bool = True,
+        force_regenerate: bool = False,
         verbose: bool = True
     ):
         """
@@ -43,6 +47,8 @@ class CompanyGrouper:
             canonical_method: Method to select canonical names
             max_cluster_size: Maximum cluster size before splitting (default: 1000)
             use_memmap: Whether to use memory-mapped files for embeddings
+            cache_embeddings: Whether to cache embeddings to disk for reuse (default: True)
+            force_regenerate: Force regeneration of embeddings even if cache exists (default: False)
             verbose: Whether to print progress
         """
         self.model_name = model_name
@@ -54,6 +60,8 @@ class CompanyGrouper:
         self.canonical_method = canonical_method
         self.max_cluster_size = max_cluster_size
         self.use_memmap = use_memmap
+        self.cache_embeddings = cache_embeddings
+        self.force_regenerate = force_regenerate
         self.verbose = verbose
         
         self.timing_stats = {}
@@ -99,25 +107,14 @@ class CompanyGrouper:
         normalized_names, original_mapping = normalize_company_names(company_names)
         self.timing_stats['normalize'] = time.time() - norm_start
         
-        # Step 3: Generate embeddings
-        print_progress("Generating embeddings...", self.verbose)
+        # Step 3: Generate or load cached embeddings
         embed_start = time.time()
-        
-        # Determine memmap path if using memory-mapped files
-        memmap_path = None
-        if self.use_memmap:
-            checkpoint_dir = output_file.replace('.csv', '_checkpoints')
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            memmap_path = os.path.join(checkpoint_dir, 'embeddings_memmap.npy')
-        
-        embedding_gen = EmbeddingGenerator(
-            model_name=self.model_name,
-            batch_size=self.batch_size,
-            use_memmap=self.use_memmap,
-            memmap_path=memmap_path,
-            verbose=self.verbose
+        embeddings = self._get_embeddings(
+            normalized_names=normalized_names,
+            input_file=input_file,
+            output_file=output_file,
+            n_samples=n_samples
         )
-        embeddings = embedding_gen.generate_embeddings(normalized_names, memmap_path=memmap_path if self.use_memmap else None)
         self.timing_stats['embeddings'] = time.time() - embed_start
         
         # Step 4: Build FAISS index
@@ -289,4 +286,159 @@ class CompanyGrouper:
             print(f"  {stage:20s}: {format_time(duration)}")
         print(f"\nTotal time: {format_time(stats['timing']['total'])}")
         print("="*60 + "\n")
+    
+    def _get_cache_key(self, input_file: str, model_name: str) -> str:
+        """
+        Generate cache key based on file hash and model name.
+        
+        Args:
+            input_file: Path to input CSV file
+            model_name: Name of the embedding model
+            
+        Returns:
+            MD5 hash string for cache key
+        """
+        # Hash the input file (first 1MB + file stats for speed and accuracy)
+        try:
+            with open(input_file, 'rb') as f:
+                file_hash = hashlib.md5(f.read(1024*1024)).hexdigest()
+            
+            # Include file size and modification time for better cache invalidation
+            stat = os.stat(input_file)
+            cache_string = f"{model_name}_{file_hash}_{stat.st_size}_{stat.st_mtime}"
+            return hashlib.md5(cache_string.encode()).hexdigest()
+        except Exception as e:
+            # Fallback: use model name and current time if file access fails
+            cache_string = f"{model_name}_{time.time()}"
+            return hashlib.md5(cache_string.encode()).hexdigest()
+    
+    def _generate_embeddings(
+        self, 
+        normalized_names: List[str],
+        cache_path: Optional[str] = None
+    ) -> np.ndarray:
+        """
+        Generate embeddings and optionally save to cache.
+        
+        Args:
+            normalized_names: List of normalized company names
+            cache_path: Optional path to save embeddings cache
+            
+        Returns:
+            Numpy array of embeddings
+        """
+        print_progress("Generating embeddings...", self.verbose)
+        
+        # Determine memmap path if using memory-mapped files
+        memmap_path = cache_path if (self.use_memmap and cache_path) else None
+        
+        embedding_gen = EmbeddingGenerator(
+            model_name=self.model_name,
+            batch_size=self.batch_size,
+            use_memmap=self.use_memmap,
+            memmap_path=memmap_path,
+            verbose=self.verbose
+        )
+        embeddings = embedding_gen.generate_embeddings(
+            normalized_names, 
+            memmap_path=memmap_path if self.use_memmap else None
+        )
+        
+        # Save to cache if not using memmap and caching is enabled
+        if (not self.use_memmap and cache_path and self.cache_embeddings):
+            print_progress(f"Saving embeddings to cache: {cache_path}...", self.verbose)
+            np.save(cache_path, embeddings)
+        
+        return embeddings
+    
+    def _get_embeddings(
+        self,
+        normalized_names: List[str],
+        input_file: str,
+        output_file: str,
+        n_samples: int
+    ) -> np.ndarray:
+        """
+        Get embeddings from cache or generate new ones.
+        
+        Args:
+            normalized_names: List of normalized company names
+            input_file: Path to input CSV file
+            output_file: Path to output CSV file
+            n_samples: Number of samples
+            
+        Returns:
+            Numpy array of embeddings
+        """
+        embeddings = None
+        
+        # Check for cached embeddings if caching is enabled
+        if self.cache_embeddings and not self.force_regenerate:
+            cache_key = self._get_cache_key(input_file, self.model_name)
+            cache_dir = os.path.join(os.path.dirname(output_file) or '.', '.embedding_cache')
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_path = os.path.join(cache_dir, f"{cache_key}.npy")
+            cache_meta_path = os.path.join(cache_dir, f"{cache_key}.json")
+            
+            # Check if cached embeddings exist
+            if os.path.exists(cache_path) and os.path.exists(cache_meta_path):
+                try:
+                    with open(cache_meta_path, 'r') as f:
+                        cache_meta = json.load(f)
+                    
+                    # Verify cache is valid (same model, same number of samples)
+                    if (cache_meta.get('model_name') == self.model_name and 
+                        cache_meta.get('n_samples') == n_samples):
+                        print_progress(f"Loading cached embeddings from {cache_path}...", self.verbose)
+                        
+                        # Load embeddings (memory-mapped if large file)
+                        if self.use_memmap:
+                            embedding_dim = cache_meta.get('embedding_dim', 384)
+                            embeddings = np.memmap(
+                                cache_path,
+                                dtype='float32',
+                                mode='r',
+                                shape=(n_samples, embedding_dim)
+                            )
+                        else:
+                            embeddings = np.load(cache_path, mmap_mode='r' if n_samples > 500000 else None)
+                        
+                        cache_age = time.time() - cache_meta.get('created', 0)
+                        print_progress(f"Cache loaded successfully (age: {cache_age/3600:.1f} hours)", self.verbose)
+                    else:
+                        print_progress("Cache invalid (model or data changed), regenerating...", self.verbose)
+                        embeddings = None
+                except Exception as e:
+                    print_progress(f"Error loading cache: {e}, regenerating...", self.verbose)
+                    embeddings = None
+        
+        # Generate embeddings if not loaded from cache
+        if embeddings is None:
+            # Determine cache path for saving
+            cache_path = None
+            if self.cache_embeddings:
+                cache_key = self._get_cache_key(input_file, self.model_name)
+                cache_dir = os.path.join(os.path.dirname(output_file) or '.', '.embedding_cache')
+                os.makedirs(cache_dir, exist_ok=True)
+                cache_path = os.path.join(cache_dir, f"{cache_key}.npy")
+                cache_meta_path = os.path.join(cache_dir, f"{cache_key}.json")
+            
+            embeddings = self._generate_embeddings(normalized_names, cache_path)
+            
+            # Save cache metadata
+            if cache_path and self.cache_embeddings:
+                embedding_dim = embeddings.shape[1]
+                cache_meta = {
+                    'model_name': self.model_name,
+                    'n_samples': n_samples,
+                    'embedding_dim': embedding_dim,
+                    'created': time.time()
+                }
+                try:
+                    with open(cache_meta_path, 'w') as f:
+                        json.dump(cache_meta, f)
+                except Exception as e:
+                    print_progress(f"Warning: Could not save cache metadata: {e}", self.verbose)
+        
+        return embeddings
 

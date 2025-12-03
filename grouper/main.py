@@ -106,6 +106,26 @@ Examples:
     )
     
     parser.add_argument(
+        '--cache-embeddings',
+        action='store_true',
+        default=True,
+        help='Cache embeddings to disk for reuse (default: True, saves time on subsequent runs)'
+    )
+    
+    parser.add_argument(
+        '--no-cache-embeddings',
+        dest='cache_embeddings',
+        action='store_false',
+        help='Disable embedding caching'
+    )
+    
+    parser.add_argument(
+        '--force-regenerate',
+        action='store_true',
+        help='Force regeneration of embeddings even if cache exists'
+    )
+    
+    parser.add_argument(
         '--canonical-method',
         type=str,
         default='longest',
@@ -144,6 +164,8 @@ Examples:
         canonical_method=args.canonical_method,
         max_cluster_size=args.max_cluster_size,
         use_memmap=args.use_memmap,
+        cache_embeddings=args.cache_embeddings,
+        force_regenerate=args.force_regenerate,
         verbose=not args.quiet
     )
     
