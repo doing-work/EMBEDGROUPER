@@ -27,6 +27,7 @@ class CompanyGrouper:
         clustering_method: str = "connected_components",
         canonical_method: str = "longest",
         max_cluster_size: int = 1000,
+        use_memmap: bool = False,
         verbose: bool = True
     ):
         """
