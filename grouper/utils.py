@@ -2,7 +2,7 @@
 
 import torch
 import sys
-from typing import Optional
+from typing import Optional, Dict
 
 
 def get_device() -> str:
