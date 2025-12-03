@@ -32,6 +32,8 @@ class CompanyGrouper:
         use_memmap: bool = False,
         cache_embeddings: bool = True,
         force_regenerate: bool = False,
+        reduce_dimensions: Optional[int] = None,
+        preserve_variance: float = 0.95,
         verbose: bool = True
     ):
         """
@@ -49,6 +51,8 @@ class CompanyGrouper:
             use_memmap: Whether to use memory-mapped files for embeddings
             cache_embeddings: Whether to cache embeddings to disk for reuse (default: True)
             force_regenerate: Force regeneration of embeddings even if cache exists (default: False)
+            reduce_dimensions: Target dimension for PCA reduction (None to disable, e.g., 256, 128)
+            preserve_variance: Variance to preserve when using PCA (0.0-1.0, default: 0.95)
             verbose: Whether to print progress
         """
         self.model_name = model_name
@@ -62,6 +66,8 @@ class CompanyGrouper:
         self.use_memmap = use_memmap
         self.cache_embeddings = cache_embeddings
         self.force_regenerate = force_regenerate
+        self.reduce_dimensions = reduce_dimensions
+        self.preserve_variance = preserve_variance
         self.verbose = verbose
         
         self.timing_stats = {}
@@ -116,6 +122,17 @@ class CompanyGrouper:
             n_samples=n_samples
         )
         self.timing_stats['embeddings'] = time.time() - embed_start
+        
+        # Step 3.5: Apply dimension reduction if requested
+        if self.reduce_dimensions is not None:
+            reduce_start = time.time()
+            embeddings = self._reduce_embeddings(
+                embeddings=embeddings,
+                input_file=input_file,
+                output_file=output_file,
+                n_samples=n_samples
+            )
+            self.timing_stats['dimension_reduction'] = time.time() - reduce_start
         
         # Step 4: Build FAISS index
         print_progress("Building FAISS index...", self.verbose)
@@ -441,4 +458,157 @@ class CompanyGrouper:
                     print_progress(f"Warning: Could not save cache metadata: {e}", self.verbose)
         
         return embeddings
+    
+    def _reduce_embeddings(
+        self,
+        embeddings: np.ndarray,
+        input_file: str,
+        output_file: str,
+        n_samples: int
+    ) -> np.ndarray:
+        """
+        Apply PCA dimension reduction to embeddings.
+        
+        Args:
+            embeddings: Original embeddings (n_samples, original_dim)
+            input_file: Path to input CSV file (for cache key)
+            output_file: Path to output CSV file (for cache location)
+            n_samples: Number of samples
+            
+        Returns:
+            Reduced embeddings (n_samples, reduced_dim)
+        """
+        try:
+            from sklearn.decomposition import PCA
+        except ImportError:
+            raise ImportError(
+                "scikit-learn is required for dimension reduction. "
+                "Install with: pip install scikit-learn"
+            )
+        
+        original_dim = embeddings.shape[1]
+        target_dim = self.reduce_dimensions
+        
+        # Validate target dimension
+        if target_dim >= original_dim:
+            print_progress(
+                f"Warning: Target dimension ({target_dim}) >= original ({original_dim}), skipping reduction",
+                self.verbose
+            )
+            return embeddings
+        
+        if target_dim < 32:
+            print_progress(
+                f"Warning: Target dimension ({target_dim}) is very low, may affect quality",
+                self.verbose
+            )
+        
+        # Check for cached reduced embeddings
+        cache_key = None
+        cache_path = None
+        cache_meta_path = None
+        
+        if self.cache_embeddings:
+            # Create cache key based on original embeddings hash
+            cache_key_base = self._get_cache_key(input_file, self.model_name)
+            cache_key = f"{cache_key_base}_reduced_{target_dim}_{self.preserve_variance}"
+            cache_dir = os.path.join(os.path.dirname(output_file) or '.', '.embedding_cache')
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_path = os.path.join(cache_dir, f"{cache_key}.npy")
+            cache_meta_path = os.path.join(cache_dir, f"{cache_key}.json")
+            
+            # Try to load cached reduced embeddings
+            if os.path.exists(cache_path) and os.path.exists(cache_meta_path) and not self.force_regenerate:
+                try:
+                    with open(cache_meta_path, 'r') as f:
+                        cache_meta = json.load(f)
+                    
+                    if (cache_meta.get('original_dim') == original_dim and
+                        cache_meta.get('reduced_dim') == target_dim and
+                        cache_meta.get('n_samples') == n_samples):
+                        print_progress(f"Loading cached reduced embeddings from {cache_path}...", self.verbose)
+                        
+                        if self.use_memmap:
+                            reduced_embeddings = np.memmap(
+                                cache_path,
+                                dtype='float32',
+                                mode='r',
+                                shape=(n_samples, target_dim)
+                            )
+                        else:
+                            reduced_embeddings = np.load(cache_path, mmap_mode='r' if n_samples > 500000 else None)
+                        
+                        variance_explained = cache_meta.get('variance_explained', 0.0)
+                        print_progress(
+                            f"Reduced embeddings loaded: {original_dim}D -> {target_dim}D "
+                            f"(variance explained: {variance_explained:.2%})",
+                            self.verbose
+                        )
+                        return reduced_embeddings
+                except Exception as e:
+                    print_progress(f"Error loading reduced cache: {e}, regenerating...", self.verbose)
+        
+        # Apply PCA reduction
+        print_progress(
+            f"Reducing embeddings: {original_dim}D -> {target_dim}D using PCA...",
+            self.verbose
+        )
+        
+        # Determine PCA parameters
+        if self.preserve_variance > 0 and self.preserve_variance < 1.0:
+            # Use variance-based selection
+            pca = PCA(n_components=self.preserve_variance)
+            pca.fit(embeddings)
+            
+            # Find number of components needed
+            cumsum_variance = np.cumsum(pca.explained_variance_ratio_)
+            n_components = np.argmax(cumsum_variance >= self.preserve_variance) + 1
+            
+            # Use the smaller of target_dim or n_components needed for variance
+            actual_dim = min(target_dim, n_components)
+            
+            print_progress(
+                f"PCA analysis: {actual_dim} components preserve {cumsum_variance[actual_dim-1]:.2%} variance",
+                self.verbose
+            )
+            
+            pca = PCA(n_components=actual_dim)
+        else:
+            # Use fixed dimension
+            pca = PCA(n_components=target_dim)
+            actual_dim = target_dim
+        
+        # Fit and transform
+        reduced_embeddings = pca.fit_transform(embeddings)
+        
+        # Calculate variance explained
+        variance_explained = np.sum(pca.explained_variance_ratio_)
+        
+        print_progress(
+            f"Dimension reduction complete: {original_dim}D -> {actual_dim}D "
+            f"(variance explained: {variance_explained:.2%}, "
+            f"memory saved: {(1 - actual_dim/original_dim)*100:.1f}%)",
+            self.verbose
+        )
+        
+        # Save to cache if enabled
+        if cache_path and self.cache_embeddings:
+            print_progress(f"Saving reduced embeddings to cache: {cache_path}...", self.verbose)
+            np.save(cache_path, reduced_embeddings)
+            
+            cache_meta = {
+                'original_dim': original_dim,
+                'reduced_dim': actual_dim,
+                'n_samples': n_samples,
+                'variance_explained': float(variance_explained),
+                'preserve_variance': self.preserve_variance,
+                'created': time.time()
+            }
+            try:
+                with open(cache_meta_path, 'w') as f:
+                    json.dump(cache_meta, f)
+            except Exception as e:
+                print_progress(f"Warning: Could not save reduction cache metadata: {e}", self.verbose)
+        
+        return reduced_embeddings
 

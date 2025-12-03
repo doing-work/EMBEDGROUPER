@@ -126,6 +126,21 @@ Examples:
     )
     
     parser.add_argument(
+        '--reduce-dimensions',
+        type=int,
+        default=None,
+        metavar='N',
+        help='Reduce embedding dimensions using PCA (e.g., 256, 128, 64). Reduces memory usage and speeds up FAISS operations'
+    )
+    
+    parser.add_argument(
+        '--preserve-variance',
+        type=float,
+        default=0.95,
+        help='Variance to preserve when using PCA (0.0-1.0, default: 0.95). Higher values preserve more information but may use more dimensions'
+    )
+    
+    parser.add_argument(
         '--canonical-method',
         type=str,
         default='longest',
@@ -166,6 +181,8 @@ Examples:
         use_memmap=args.use_memmap,
         cache_embeddings=args.cache_embeddings,
         force_regenerate=args.force_regenerate,
+        reduce_dimensions=args.reduce_dimensions,
+        preserve_variance=args.preserve_variance,
         verbose=not args.quiet
     )
     
