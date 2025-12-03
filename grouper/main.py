@@ -95,8 +95,11 @@ Examples:
         '--clustering',
         type=str,
         default='connected_components',
-        choices=['connected_components', 'hdbscan', 'agglomerative'],
-        help='Clustering method (default: connected_components). hdbscan and agglomerative work directly on embeddings without FAISS search'
+        choices=['connected_components', 'hdbscan', 'agglomerative', 'minhash', 'hybrid'],
+        help='Clustering method (default: connected_components). '
+             'minhash: Fast MinHash-based matching. '
+             'hybrid: MinHash for exact matches + embeddings for semantic matching (recommended). '
+             'hdbscan/agglomerative: Work directly on embeddings without FAISS search'
     )
     
     parser.add_argument(

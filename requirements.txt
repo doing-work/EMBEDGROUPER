@@ -8,6 +8,7 @@ tqdm>=4.62.0
 torch>=1.9.0
 hdbscan>=0.8.33
 psutil>=5.8.0
+datasketch>=1.6.0
 cudf-cu12>=24.0.0
 cugraph-cu12>=24.0.0
 

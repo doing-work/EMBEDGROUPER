@@ -467,6 +467,248 @@ def cluster_with_hdbscan(
     return cluster_assignments
 
 
+def cluster_with_minhash(
+    normalized_names: List[str],
+    threshold: float = 0.5,
+    num_perm: int = 128,
+    shingle_size: int = 3,
+    verbose: bool = True
+) -> Dict[int, int]:
+    """
+    Cluster company names using MinHash LSH for fast approximate matching.
+    
+    Args:
+        normalized_names: List of normalized company names
+        threshold: Jaccard similarity threshold (0.0-1.0, default: 0.5)
+        num_perm: Number of permutations for MinHash (higher = more accurate, default: 128)
+        shingle_size: Size of character shingles/n-grams (default: 3)
+        verbose: Whether to print progress
+        
+    Returns:
+        Dict mapping index -> cluster_id
+    """
+    try:
+        from datasketch import MinHash, MinHashLSH
+    except ImportError:
+        raise ImportError(
+            "datasketch is required for MinHash clustering. Install with: pip install datasketch"
+        )
+    
+    print_progress(f"Clustering with MinHash (threshold={threshold}, num_perm={num_perm})...", verbose)
+    
+    n_samples = len(normalized_names)
+    
+    # Create MinHash for each company name
+    print_progress("Creating MinHash signatures...", verbose)
+    minhashes = []
+    for idx, name in enumerate(normalized_names):
+        mh = MinHash(num_perm=num_perm)
+        # Add character shingles (n-grams)
+        for i in range(len(name) - shingle_size + 1):
+            shingle = name[i:i+shingle_size]
+            mh.update(shingle.encode('utf8'))
+        minhashes.append(mh)
+        
+        if verbose and (idx + 1) % 100000 == 0:
+            print_progress(f"  Processed {idx + 1:,} names...", verbose)
+    
+    # Create LSH index
+    print_progress("Building LSH index...", verbose)
+    lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
+    
+    # Insert all MinHashes into LSH
+    for idx, mh in enumerate(minhashes):
+        lsh.insert(idx, mh)
+    
+    # Find clusters using Union-Find
+    print_progress("Finding similar pairs using LSH...", verbose)
+    uf = UnionFind(n_samples)
+    edge_count = 0
+    
+    # Query LSH for each item
+    processed = set()
+    for idx, mh in enumerate(minhashes):
+        if idx in processed:
+            continue
+        
+        # Query LSH for similar items
+        similar_indices = lsh.query(mh)
+        
+        # Add edges to Union-Find (only add once per pair)
+        for similar_idx in similar_indices:
+            if similar_idx != idx and similar_idx not in processed:
+                uf.union(idx, similar_idx)
+                edge_count += 1
+        
+        processed.add(idx)
+        
+        if verbose and (idx + 1) % 100000 == 0:
+            print_progress(f"  Processed {idx + 1:,} queries...", verbose)
+    
+    # Build cluster assignments
+    cluster_assignments = _build_cluster_assignments_from_unionfind(uf, n_samples, verbose)
+    
+    print_progress(f"MinHash found {len(set(cluster_assignments.values()))} clusters ({edge_count:,} edges)", verbose)
+    
+    return cluster_assignments
+
+
+def cluster_with_hybrid(
+    normalized_names: List[str],
+    embeddings: np.ndarray,
+    faiss_index,
+    minhash_threshold: float = 0.5,
+    embedding_threshold: float = 0.75,
+    top_k: int = 100,
+    num_perm: int = 128,
+    shingle_size: int = 3,
+    verbose: bool = True
+) -> Dict[int, int]:
+    """
+    Hybrid clustering: MinHash for fast initial grouping + Embeddings for semantic matching.
+    
+    Strategy:
+    1. Use MinHash to find obvious matches (exact/partial string matches)
+    2. Use embeddings to find semantic matches for unmatched items
+    3. Merge results intelligently
+    
+    Args:
+        normalized_names: List of normalized company names
+        embeddings: Embedding vectors (n_samples, embedding_dim)
+        faiss_index: FAISSIndex instance for semantic search
+        minhash_threshold: MinHash Jaccard similarity threshold (default: 0.5)
+        embedding_threshold: Embedding cosine similarity threshold (default: 0.75)
+        top_k: Number of neighbors to retrieve for embedding search
+        num_perm: Number of permutations for MinHash
+        shingle_size: Size of character shingles
+        verbose: Whether to print progress
+        
+    Returns:
+        Dict mapping index -> cluster_id
+    """
+    print_progress("="*60, verbose)
+    print_progress("HYBRID CLUSTERING: MinHash + Embeddings", verbose)
+    print_progress("="*60, verbose)
+    
+    n_samples = len(normalized_names)
+    
+    # Stage 1: MinHash clustering
+    print_progress("\nStage 1: MinHash clustering (fast, exact/partial matches)...", verbose)
+    minhash_clusters = cluster_with_minhash(
+        normalized_names=normalized_names,
+        threshold=minhash_threshold,
+        num_perm=num_perm,
+        shingle_size=shingle_size,
+        verbose=verbose
+    )
+    
+    # Identify items that were matched by MinHash
+    minhash_matched = set()
+    minhash_cluster_map = {}  # cluster_id -> set of indices
+    
+    for idx, cluster_id in minhash_clusters.items():
+        if cluster_id not in minhash_cluster_map:
+            minhash_cluster_map[cluster_id] = set()
+        minhash_cluster_map[cluster_id].add(idx)
+        minhash_matched.add(idx)
+    
+    # Find unmatched items (singletons from MinHash)
+    unmatched_indices = [idx for idx, cluster_id in minhash_clusters.items() 
+                        if len(minhash_cluster_map[cluster_id]) == 1]
+    
+    print_progress(f"\nMinHash matched: {len(minhash_matched) - len(unmatched_indices):,} items", verbose)
+    print_progress(f"Unmatched items: {len(unmatched_indices):,} items", verbose)
+    
+    # Stage 2: Embedding-based clustering for unmatched items
+    if unmatched_indices:
+        print_progress(f"\nStage 2: Embedding clustering for {len(unmatched_indices):,} unmatched items...", verbose)
+        
+        # Create mapping from unmatched index to original index
+        unmatched_to_original = {i: idx for i, idx in enumerate(unmatched_indices)}
+        original_to_unmatched = {idx: i for i, idx in enumerate(unmatched_indices)}
+        
+        # Extract embeddings for unmatched items
+        unmatched_embeddings = embeddings[unmatched_indices]
+        unmatched_set = set(unmatched_indices)
+        
+        # Find similar pairs using embeddings
+        uf_unmatched = UnionFind(len(unmatched_indices))
+        edge_count_embedding = 0
+        
+        # Use existing FAISS index to search for similar unmatched items
+        # Search in full index, but filter results to only unmatched indices
+        batch_size = min(1000, len(unmatched_indices))
+        for i in range(0, len(unmatched_indices), batch_size):
+            end_idx = min(i + batch_size, len(unmatched_indices))
+            batch_embeddings = unmatched_embeddings[i:end_idx]
+            
+            # Search in full FAISS index
+            distances_batch, indices_batch = faiss_index.search(
+                batch_embeddings,
+                k=min(top_k * 2, n_samples),  # Search more to find unmatched items
+                threshold=embedding_threshold - 0.05  # Slightly lower for search
+            )
+            
+            for local_idx, global_unmatched_idx in enumerate(range(i, end_idx)):
+                distances = distances_batch[local_idx]
+                indices = indices_batch[local_idx]
+                original_unmatched_idx = unmatched_indices[global_unmatched_idx]
+                
+                for j, neighbor_original_idx in enumerate(indices):
+                    if (neighbor_original_idx != -1 and 
+                        neighbor_original_idx in unmatched_set and
+                        neighbor_original_idx != original_unmatched_idx and
+                        distances[j] >= embedding_threshold):
+                        neighbor_local_idx = original_to_unmatched[neighbor_original_idx]
+                        uf_unmatched.union(global_unmatched_idx, neighbor_local_idx)
+                        edge_count_embedding += 1
+        
+        # Build cluster assignments for unmatched items
+        embedding_clusters_unmatched = _build_cluster_assignments_from_unionfind(
+            uf_unmatched, len(unmatched_indices), False
+        )
+        
+        print_progress(f"Embedding clustering found {len(set(embedding_clusters_unmatched.values()))} clusters", verbose)
+        print_progress(f"Embedding edges added: {edge_count_embedding:,}", verbose)
+    else:
+        embedding_clusters_unmatched = {}
+        unmatched_to_original = {}
+    
+    # Stage 3: Merge results
+    print_progress("\nStage 3: Merging MinHash and Embedding clusters...", verbose)
+    
+    # Start with MinHash clusters
+    final_clusters = minhash_clusters.copy()
+    
+    # Get next available cluster ID
+    next_cluster_id = max(minhash_clusters.values()) + 1 if minhash_clusters else 0
+    
+    # Map embedding clusters to final clusters
+    embedding_cluster_map = {}  # embedding_cluster_id -> final_cluster_id
+    
+    for unmatched_local_idx, embedding_cluster_id in embedding_clusters_unmatched.items():
+        original_idx = unmatched_to_original[unmatched_local_idx]
+        
+        if embedding_cluster_id not in embedding_cluster_map:
+            embedding_cluster_map[embedding_cluster_id] = next_cluster_id
+            next_cluster_id += 1
+        
+        final_clusters[original_idx] = embedding_cluster_map[embedding_cluster_id]
+    
+    # Handle singletons from embedding clustering (assign unique IDs)
+    for unmatched_local_idx in range(len(unmatched_indices)):
+        original_idx = unmatched_to_original[unmatched_local_idx]
+        if original_idx not in final_clusters:
+            final_clusters[original_idx] = next_cluster_id
+            next_cluster_id += 1
+    
+    num_final_clusters = len(set(final_clusters.values()))
+    print_progress(f"\nFinal clusters: {num_final_clusters:,}", verbose)
+    print_progress("="*60 + "\n", verbose)
+    
+    return final_clusters
+
+
 def cluster_with_agglomerative(
     embeddings: np.ndarray,
     threshold: float = 0.85,
@@ -561,7 +803,31 @@ def cluster_companies(
         - cluster_sizes: Dict mapping cluster_id -> cluster size
     """
     # Route to appropriate clustering method
-    if clustering_method == "hdbscan":
+    if clustering_method == "minhash":
+        # MinHash clustering - works on text directly
+        print_progress("Using MinHash clustering method...", verbose)
+        cluster_assignments = cluster_with_minhash(
+            normalized_names=normalized_names,
+            threshold=threshold,  # Use threshold as MinHash Jaccard threshold
+            verbose=verbose
+        )
+        # Set dummy neighbor counts (not applicable for MinHash)
+        neighbor_counts = {i: 0 for i in range(n_samples)}
+    elif clustering_method == "hybrid":
+        # Hybrid clustering: MinHash + Embeddings
+        print_progress("Using Hybrid clustering method (MinHash + Embeddings)...", verbose)
+        cluster_assignments = cluster_with_hybrid(
+            normalized_names=normalized_names,
+            embeddings=embeddings,
+            faiss_index=faiss_index,
+            minhash_threshold=max(0.3, threshold - 0.2),  # Lower threshold for MinHash
+            embedding_threshold=threshold,
+            top_k=top_k,
+            verbose=verbose
+        )
+        # Set dummy neighbor counts (not applicable for hybrid)
+        neighbor_counts = {i: 0 for i in range(n_samples)}
+    elif clustering_method == "hdbscan":
         # HDBSCAN clustering - works directly on embeddings
         print_progress("Using HDBSCAN clustering method...", verbose)
         # Auto-determine min_cluster_size based on dataset size
@@ -597,7 +863,10 @@ def cluster_companies(
             verbose=verbose
         )
     else:
-        raise ValueError(f"Unknown clustering method: {clustering_method}. Choose from: 'connected_components', 'hdbscan', 'agglomerative'")
+        raise ValueError(
+            f"Unknown clustering method: {clustering_method}. "
+            f"Choose from: 'connected_components', 'hdbscan', 'agglomerative', 'minhash', 'hybrid'"
+        )
     
     # Handle noise points from HDBSCAN (label -1) - assign them unique cluster IDs
     if clustering_method == "hdbscan":
